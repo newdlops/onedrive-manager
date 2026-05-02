@@ -1,0 +1,10 @@
+node_modules/
+out/
+dist/
+release/
+coverage/
+*.log
+*.tsbuildinfo
+.vscode/.auto-import-cache/
+.DS_Store
+Thumbs.db
