@@ -8,7 +8,7 @@ function createWindow(): void {
     height: 760,
     minWidth: 920,
     minHeight: 620,
-    title: 'OneDrive Manager',
+    title: 'OneDrive 관리자',
     backgroundColor: '#f7f5ef',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -66,4 +66,3 @@ app.on('window-all-closed', () => {
     app.quit()
   }
 })
-

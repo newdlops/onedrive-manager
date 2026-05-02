@@ -14,6 +14,13 @@ const platformLabels: Record<string, string> = {
   linux: 'Linux'
 }
 
+const sourceLabels: Record<OneDriveLocation['source'], string> = {
+  'cloud-storage': 'CloudStorage',
+  environment: '환경 변수',
+  home: '홈 폴더',
+  'user-profile': '사용자 프로필'
+}
+
 export function App(): ReactElement {
   const [loadState, setLoadState] = useState<LoadState>({ status: 'loading' })
   const [openingPath, setOpeningPath] = useState<string | null>(null)
@@ -27,7 +34,7 @@ export function App(): ReactElement {
     } catch (error) {
       setLoadState({
         status: 'error',
-        message: error instanceof Error ? error.message : 'Environment check failed.'
+        message: error instanceof Error ? error.message : '환경 정보를 확인하지 못했습니다.'
       })
     }
   }
@@ -38,7 +45,7 @@ export function App(): ReactElement {
 
   const content = useMemo(() => {
     if (loadState.status === 'loading') {
-      return <div className="empty-state">Checking local OneDrive paths...</div>
+      return <div className="empty-state">로컬 OneDrive 경로를 확인하는 중입니다...</div>
     }
 
     if (loadState.status === 'error') {
@@ -47,20 +54,20 @@ export function App(): ReactElement {
 
     return (
       <>
-        <section className="summary-grid" aria-label="Runtime summary">
-          <SummaryTile label="Platform" value={platformLabels[loadState.environment.platform.name] ?? loadState.environment.platform.name} />
-          <SummaryTile label="Architecture" value={loadState.environment.platform.arch} />
-          <SummaryTile label="Detected paths" value={String(loadState.environment.oneDriveLocations.filter((location) => location.exists).length)} />
+        <section className="summary-grid" aria-label="실행 환경 요약">
+          <SummaryTile label="플랫폼" value={platformLabels[loadState.environment.platform.name] ?? loadState.environment.platform.name} />
+          <SummaryTile label="아키텍처" value={loadState.environment.platform.arch} />
+          <SummaryTile label="감지된 경로" value={String(loadState.environment.oneDriveLocations.filter((location) => location.exists).length)} />
         </section>
 
         <section className="panel" aria-labelledby="paths-title">
           <div className="panel-heading">
             <div>
-              <h2 id="paths-title">OneDrive Paths</h2>
+              <h2 id="paths-title">OneDrive 경로</h2>
               <p>{loadState.environment.platform.homeDirectory}</p>
             </div>
             <button className="secondary-button" type="button" onClick={() => void refreshEnvironment()}>
-              Refresh
+              새로고침
             </button>
           </div>
 
@@ -87,8 +94,8 @@ export function App(): ReactElement {
         <section className="panel compact" aria-labelledby="build-title">
           <div className="panel-heading">
             <div>
-              <h2 id="build-title">Build Targets</h2>
-              <p>macOS DMG/ZIP, Windows NSIS/ZIP, x64 and arm64.</p>
+              <h2 id="build-title">빌드 대상</h2>
+              <p>macOS DMG/ZIP, Windows NSIS/ZIP, x64 및 arm64를 지원합니다.</p>
             </div>
           </div>
         </section>
@@ -101,7 +108,7 @@ export function App(): ReactElement {
       <header className="app-header">
         <div>
           <p className="eyebrow">Desktop</p>
-          <h1>OneDrive Manager</h1>
+          <h1>OneDrive 관리자</h1>
         </div>
         <div className="status-pill">Windows + macOS</div>
       </header>
@@ -135,12 +142,12 @@ function PathRow({
       <div className="path-copy">
         <div className="path-title">
           <strong>{location.label}</strong>
-          <span>{location.source}</span>
+          <span>{sourceLabels[location.source]}</span>
         </div>
         <code>{location.path}</code>
       </div>
       <button className="primary-button" type="button" disabled={!location.exists || isOpening} onClick={() => void onReveal()}>
-        {isOpening ? 'Opening' : 'Open'}
+        {isOpening ? '여는 중' : '열기'}
       </button>
     </article>
   )

@@ -2,6 +2,10 @@
 
 Cross-platform Electron desktop app for managing Microsoft OneDrive on Windows and macOS.
 
+## Language Policy
+
+The application currently supports Korean only. Keep user-facing copy in Korean and avoid adding an i18n abstraction until multi-language support becomes a real requirement.
+
 ## Platform Policy
 
 - Keep OS-specific behavior in the Electron main process behind small platform modules.
@@ -31,4 +35,3 @@ src/preload/    Typed IPC bridge exposed to the renderer
 src/renderer/   React UI
 src/shared/     Types shared by main, preload, and renderer
 ```
-

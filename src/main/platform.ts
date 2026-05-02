@@ -26,17 +26,17 @@ export async function getAppEnvironment(): Promise<AppEnvironment> {
 
 export async function revealPathInFileManager(targetPath: unknown): Promise<RevealPathResult> {
   if (typeof targetPath !== 'string' || targetPath.trim().length === 0) {
-    return { ok: false, message: 'Invalid path.' }
+    return { ok: false, message: '올바른 경로가 아닙니다.' }
   }
 
   if (!isAbsolute(targetPath)) {
-    return { ok: false, message: 'Only absolute paths can be opened.' }
+    return { ok: false, message: '절대 경로만 열 수 있습니다.' }
   }
 
   const normalizedPath = resolve(targetPath)
 
   if (!(await directoryExists(normalizedPath))) {
-    return { ok: false, message: 'Path does not exist.' }
+    return { ok: false, message: '경로가 존재하지 않습니다.' }
   }
 
   shell.showItemInFolder(normalizedPath)
@@ -143,4 +143,3 @@ async function directoryExists(targetPath: string): Promise<boolean> {
     return false
   }
 }
-
