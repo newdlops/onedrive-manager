@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">OneDrive Manager icon</title>
+  <desc id="desc">A cloud file management icon with a control panel and transfer arrows.</desc>
+  <defs>
+    <linearGradient id="appBackground" x1="160" y1="112" x2="864" y2="912" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A4E8A" />
+      <stop offset="0.48" stop-color="#0F6CBD" />
+      <stop offset="1" stop-color="#10A7A7" />
+    </linearGradient>
+    <linearGradient id="cloudFill" x1="246" y1="282" x2="738" y2="736" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" />
+      <stop offset="1" stop-color="#DDF2FF" />
+    </linearGradient>
+    <linearGradient id="panelFill" x1="522" y1="516" x2="808" y2="830" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1F2937" />
+      <stop offset="1" stop-color="#0D3F67" />
+    </linearGradient>
+    <linearGradient id="accentFill" x1="588" y1="584" x2="768" y2="762" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#61E5D4" />
+      <stop offset="1" stop-color="#74C0FC" />
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="220" fill="url(#appBackground)" />
+  <path
+    d="M217 652c-68 0-123-52-123-116 0-59 46-108 106-115 23-83 99-143 189-143 62 0 119 28 155 73 30-17 65-27 102-27 102 0 185 79 185 176 0 6 0 12-1 18 57 15 99 65 99 125 0 72-61 130-136 130H217Z"
+    fill="#063B67"
+    opacity="0.18"
+  />
+  <path
+    d="M206 625c-68 0-123-52-123-116 0-59 46-108 106-115 23-83 99-143 189-143 62 0 119 28 155 73 30-17 65-27 102-27 102 0 185 79 185 176 0 6 0 12-1 18 57 15 99 65 99 125 0 72-61 130-136 130H206Z"
+    fill="url(#cloudFill)"
+  />
+  <path
+    d="M222 625c-51 0-92-38-92-86 0-45 37-82 85-86l22-2 6-22c17-63 72-108 138-108 46 0 88 21 115 56l19 24 27-15c27-16 58-24 91-24 78 0 141 60 141 134 0 4 0 9-1 15l-3 38 37 10c39 11 67 45 67 87 0 50-43 91-96 91H222"
+    fill="none"
+    stroke="#BFE7FF"
+    stroke-width="18"
+    stroke-linecap="round"
+    opacity="0.8"
+  />
+
+  <path
+    d="M292 520h252"
+    fill="none"
+    stroke="#0F6CBD"
+    stroke-width="32"
+    stroke-linecap="round"
+    opacity="0.9"
+  />
+  <path
+    d="M292 612h188"
+    fill="none"
+    stroke="#10A7A7"
+    stroke-width="32"
+    stroke-linecap="round"
+    opacity="0.9"
+  />
+  <circle cx="598" cy="520" r="26" fill="#0F6CBD" />
+  <circle cx="526" cy="612" r="26" fill="#10A7A7" />
+
+  <path
+    d="M645 418v88"
+    fill="none"
+    stroke="#1F2937"
+    stroke-width="28"
+    stroke-linecap="round"
+    opacity="0.78"
+  />
+  <path
+    d="M645 418l-40 40m40-40 40 40"
+    fill="none"
+    stroke="#1F2937"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.78"
+  />
+  <path
+    d="M374 702v-88"
+    fill="none"
+    stroke="#1F2937"
+    stroke-width="28"
+    stroke-linecap="round"
+    opacity="0.78"
+  />
+  <path
+    d="M374 702l-40-40m40 40 40-40"
+    fill="none"
+    stroke="#1F2937"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.78"
+  />
+
+  <rect x="536" y="536" width="320" height="276" rx="54" fill="#062C48" opacity="0.22" />
+  <rect x="514" y="510" width="320" height="276" rx="54" fill="url(#panelFill)" />
+  <path d="M582 604h184" stroke="#E8F7FF" stroke-width="24" stroke-linecap="round" />
+  <path d="M582 678h184" stroke="#E8F7FF" stroke-width="24" stroke-linecap="round" opacity="0.85" />
+  <path d="M582 752h184" stroke="#E8F7FF" stroke-width="24" stroke-linecap="round" opacity="0.72" />
+  <circle cx="640" cy="604" r="24" fill="url(#accentFill)" />
+  <circle cx="722" cy="678" r="24" fill="url(#accentFill)" />
+  <circle cx="674" cy="752" r="24" fill="url(#accentFill)" />
+  <path
+    d="M594 440h144c22 0 40 18 40 40v48"
+    fill="none"
+    stroke="#61E5D4"
+    stroke-width="22"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.86"
+  />
+</svg>

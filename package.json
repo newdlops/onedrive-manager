@@ -16,6 +16,7 @@
     "dist:win": "npm run build && electron-builder --win --x64 --arm64"
   },
   "dependencies": {
+    "@azure/msal-node": "^5.1.5",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },
@@ -35,6 +36,7 @@
     "appId": "app.onedrive-manager.desktop",
     "productName": "OneDrive Manager",
     "asar": true,
+    "icon": "icon.png",
     "directories": {
       "buildResources": "build",
       "output": "release"
