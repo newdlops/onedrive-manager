@@ -200,6 +200,7 @@ export type MoveDriveItemsRequest = {
 export type DownloadDriveItemRequest = {
   itemId: string
   name: string
+  type?: CloudDriveItemType
   size?: number
 }
 
@@ -215,6 +216,9 @@ export type DownloadDriveItemsRequest = {
 export type DownloadDriveItemsResult = {
   cancelled: boolean
   directoryPath?: string
+  queuedCount?: number
+  createdFolderCount?: number
+  skippedCount?: number
 }
 
 export type UploadDriveItemsRequest = {

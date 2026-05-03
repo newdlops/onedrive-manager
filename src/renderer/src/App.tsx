@@ -1639,16 +1639,16 @@ export function App(): ReactElement {
     }
   }
 
-  async function downloadSelectedItems(items = selectedFileItems): Promise<void> {
+  async function downloadSelectedItems(items = selectedItems): Promise<void> {
     if (items.length === 0 || fileOperationState.status === 'working') {
       return
     }
 
     setContextMenu(null)
-    setFileOperationState({ status: 'working', message: items.length === 1 ? '다운로드 중' : '여러 파일 다운로드 중' })
+    setFileOperationState({ status: 'working', message: items.length === 1 ? '다운로드 등록 중' : '여러 항목 다운로드 등록 중' })
 
     try {
-      if (items.length === 1) {
+      if (items.length === 1 && items[0]?.type === 'file') {
         const [item] = items
 
         if (!item) {
@@ -1659,6 +1659,7 @@ export function App(): ReactElement {
         const result = await window.oneDriveManager.downloadDriveItem({
           itemId: item.id,
           name: item.name,
+          type: item.type,
           size: item.size
         })
 
@@ -1678,6 +1679,7 @@ export function App(): ReactElement {
         items: items.map((item) => ({
           itemId: item.id,
           name: item.name,
+          type: item.type,
           size: item.size
         }))
       })
@@ -1687,14 +1689,22 @@ export function App(): ReactElement {
         return
       }
 
+      const queuedCount = result.queuedCount ?? items.filter((item) => item.type === 'file').length
+      const createdFolderCount = result.createdFolderCount ?? 0
+      const skippedCount = result.skippedCount ?? 0
+      const skippedMessage = skippedCount > 0 ? `, ${skippedCount.toLocaleString('ko-KR')}개 건너뜀` : ''
+
       setFileOperationState({
         status: 'success',
-        message: `${items.length.toLocaleString('ko-KR')}개 파일 다운로드 작업을 큐에 등록했습니다.`
+        message:
+          queuedCount > 0
+            ? `${queuedCount.toLocaleString('ko-KR')}개 파일 다운로드 작업을 큐에 등록했습니다. 폴더 ${createdFolderCount.toLocaleString('ko-KR')}개 생성${skippedMessage}.`
+            : `폴더 ${createdFolderCount.toLocaleString('ko-KR')}개를 만들었습니다${skippedMessage}.`
       })
     } catch (error) {
       setFileOperationState({
         status: 'error',
-        message: error instanceof Error ? error.message : '파일을 다운로드하지 못했습니다.'
+        message: error instanceof Error ? error.message : '항목을 다운로드하지 못했습니다.'
       })
     }
   }
@@ -1920,7 +1930,6 @@ export function App(): ReactElement {
 
   const environment = environmentState.status === 'ready' ? environmentState.environment : null
   const selectedItems = getSelectedItems()
-  const selectedFileItems = selectedItems.filter((item) => item.type === 'file')
   const singleSelectedItem = selectedItems.length === 1 ? (selectedItems[0] ?? null) : null
   const currentFolder = folderPath.at(-1) ?? rootFolder
   const isFileOperationBusy = fileOperationState.status === 'working'
@@ -1961,7 +1970,7 @@ export function App(): ReactElement {
         <button
           className="command-button"
           type="button"
-          disabled={!canUseDrive || selectedFileItems.length === 0 || isFileOperationBusy}
+          disabled={!canUseDrive || selectedItems.length === 0 || isFileOperationBusy}
           onClick={() => void downloadSelectedItems()}
         >
           다운로드
@@ -2211,7 +2220,6 @@ export function App(): ReactElement {
           canUseDrive={canUseDrive}
           isBusy={isFileOperationBusy}
           selectedItems={selectedItems}
-          selectedFileItems={selectedFileItems}
           singleSelectedItem={singleSelectedItem}
           clipboard={driveClipboard}
           compareSource={folderCompareSource}
@@ -2349,7 +2357,6 @@ function ExplorerContextMenu({
   canUseDrive,
   isBusy,
   selectedItems,
-  selectedFileItems,
   singleSelectedItem,
   clipboard,
   compareSource,
@@ -2373,7 +2380,6 @@ function ExplorerContextMenu({
   canUseDrive: boolean
   isBusy: boolean
   selectedItems: CloudDriveItem[]
-  selectedFileItems: CloudDriveItem[]
   singleSelectedItem: CloudDriveItem | null
   clipboard: DriveClipboard | null
   compareSource: FolderCompareEndpointView | null
@@ -2410,8 +2416,8 @@ function ExplorerContextMenu({
           열기
         </button>
       ) : null}
-      <button type="button" role="menuitem" disabled={!canUseDrive || selectedFileItems.length === 0 || isBusy} onClick={onDownload}>
-        {selectedFileItems.length > 1 ? `${selectedFileItems.length.toLocaleString('ko-KR')}개 다운로드` : '다운로드'}
+      <button type="button" role="menuitem" disabled={!canUseDrive || selectedItems.length === 0 || isBusy} onClick={onDownload}>
+        {selectedItems.length > 1 ? `${selectedItems.length.toLocaleString('ko-KR')}개 다운로드` : '다운로드'}
       </button>
       <span className="context-menu-separator" role="separator" />
       <button type="button" role="menuitem" disabled={!canUseDrive || selectedItems.length === 0 || isBusy} onClick={onCopy}>

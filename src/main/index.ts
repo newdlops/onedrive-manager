@@ -248,11 +248,12 @@ if (!hasSingleInstanceLock) {
 
     const [directoryPath] = selection.filePaths
 
-    await downloadDriveItemsToDirectory(request.items, directoryPath, notifyTransfers)
+    const result = await downloadDriveItemsToDirectory(request.items, directoryPath, notifyTransfers)
 
     return {
       cancelled: false,
-      directoryPath
+      directoryPath,
+      ...result
     }
   })
   ipcMain.handle('transfers:list', () => {

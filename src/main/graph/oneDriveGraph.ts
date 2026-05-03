@@ -4,7 +4,7 @@ import { createWriteStream } from 'node:fs'
 import { mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
 import { randomUUID } from 'node:crypto'
-import { basename, dirname, extname, join } from 'node:path'
+import { basename, dirname, extname, join, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { getActiveAccountId, getGraphAccessToken } from '../auth/microsoftAuth'
 import { getTransferSettings } from '../settings'
@@ -26,6 +26,7 @@ import type {
   DriveFolderReconcileRequest,
   DriveFolderReconcileResult,
   DownloadDriveItemRequest,
+  DownloadDriveItemsResult,
   DriveTransferListRequest,
   DriveTransferListResult,
   DriveTransferSummary,
@@ -1600,35 +1601,184 @@ export async function downloadDriveItemsToDirectory(
   items: DownloadDriveItemRequest[],
   directoryPath: string,
   onProgress?: DriveTransferProgressListener
-): Promise<void> {
-  const normalizedDirectoryPath = directoryPath
+): Promise<Required<Pick<DownloadDriveItemsResult, 'queuedCount' | 'createdFolderCount' | 'skippedCount'>>> {
+  const normalizedDirectoryPath = normalizeDownloadDirectoryPath(directoryPath)
 
   if (!normalizedDirectoryPath.trim()) {
     throw new Error('다운로드할 폴더를 선택하세요.')
   }
 
   if (items.length === 0) {
-    throw new Error('다운로드할 파일을 선택하세요.')
+    throw new Error('다운로드할 항목을 선택하세요.')
   }
 
-  await mkdir(normalizedDirectoryPath, { recursive: true })
+  await ensureLocalDirectory(normalizedDirectoryPath, '다운로드 대상 폴더를 준비하지 못했습니다.')
 
   const reservedPaths = new Set<string>()
   const state = await readDriveTransferState()
   const tasks: InternalDriveTransferTask[] = []
   const accountId = await getActiveAccountId()
+  const accessToken = items.some((item) => item.type === 'folder') ? await getGraphAccessToken(accountId ?? undefined) : null
+  const stats = {
+    queuedCount: 0,
+    createdFolderCount: 0,
+    skippedCount: 0
+  }
+
+  async function flushTasks(): Promise<void> {
+    if (tasks.length === 0) {
+      return
+    }
+
+    const nextTasks = tasks.splice(0, tasks.length)
+    await registerDriveTransferTasks(nextTasks)
+    await writeDriveTransferState({ version: 1, tasks: nextTasks }, onProgress)
+    scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
+  }
 
   for (const item of items) {
     const name = validateDriveItemName(item.name)
     const localPath = await createUniqueDownloadPath(normalizedDirectoryPath, name, reservedPaths)
 
-    reservedPaths.add(localPath.toLowerCase())
-    tasks.push(queueDownloadTask(state, item.itemId, name, item.size, localPath, accountId))
+    reservedPaths.add(normalizeLocalPathKey(localPath))
+    await queueDriveItemDownloadToPath({
+      state,
+      tasks,
+      item: {
+        ...item,
+        name
+      },
+      localPath,
+      accountId,
+      accessToken,
+      reservedPaths,
+      stats,
+      flushTasks
+    })
   }
 
-  await registerDriveTransferTasks(tasks)
-  await writeDriveTransferState({ version: 1, tasks }, onProgress)
+  await flushTasks()
   scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
+  return stats
+}
+
+async function queueDriveItemDownloadToPath({
+  state,
+  tasks,
+  item,
+  localPath,
+  accountId,
+  accessToken,
+  reservedPaths,
+  stats,
+  flushTasks
+}: {
+  state: DriveTransferState
+  tasks: InternalDriveTransferTask[]
+  item: DownloadDriveItemRequest
+  localPath: string
+  accountId: string | null
+  accessToken: string | null
+  reservedPaths: Set<string>
+  stats: Required<Pick<DownloadDriveItemsResult, 'queuedCount' | 'createdFolderCount' | 'skippedCount'>>
+  flushTasks: () => Promise<void>
+}): Promise<void> {
+  const itemType = item.type ?? 'file'
+
+  if (itemType === 'package') {
+    stats.skippedCount += 1
+    return
+  }
+
+  if (itemType === 'folder') {
+    if (!accessToken) {
+      throw new Error('폴더 다운로드를 위한 OneDrive 인증 정보를 찾지 못했습니다.')
+    }
+
+    stats.createdFolderCount += 1
+    await ensureLocalDirectory(localPath, '다운로드 폴더를 만들지 못했습니다.')
+    await queueDriveFolderChildrenDownload({
+      state,
+      tasks,
+      folderId: item.itemId,
+      localDirectoryPath: localPath,
+      accountId,
+      accessToken,
+      reservedPaths,
+      stats,
+      flushTasks
+    })
+    return
+  }
+
+  tasks.push(queueDownloadTask(state, item.itemId, item.name, item.size, localPath, accountId))
+  stats.queuedCount += 1
+
+  if (tasks.length >= UPLOAD_QUEUE_BATCH_SIZE) {
+    await flushTasks()
+  }
+}
+
+async function queueDriveFolderChildrenDownload({
+  state,
+  tasks,
+  folderId,
+  localDirectoryPath,
+  accountId,
+  accessToken,
+  reservedPaths,
+  stats,
+  flushTasks
+}: {
+  state: DriveTransferState
+  tasks: InternalDriveTransferTask[]
+  folderId: string
+  localDirectoryPath: string
+  accountId: string | null
+  accessToken: string
+  reservedPaths: Set<string>
+  stats: Required<Pick<DownloadDriveItemsResult, 'queuedCount' | 'createdFolderCount' | 'skippedCount'>>
+  flushTasks: () => Promise<void>
+}): Promise<void> {
+  let url = createChildrenUrlForItem(validateDriveItemId(folderId))
+
+  while (true) {
+    const response = await graphGet<GraphChildrenResponse>(url, accessToken)
+
+    for (const child of response.value ?? []) {
+      if (!child.id) {
+        continue
+      }
+
+      const childItem = mapDriveItem(child)
+      const childName = validateDriveItemName(childItem.name)
+      const localPath = await createUniqueDownloadPath(localDirectoryPath, childName, reservedPaths)
+
+      reservedPaths.add(normalizeLocalPathKey(localPath))
+      await queueDriveItemDownloadToPath({
+        state,
+        tasks,
+        item: {
+          itemId: childItem.id,
+          name: childName,
+          type: childItem.type,
+          size: childItem.size
+        },
+        localPath,
+        accountId,
+        accessToken,
+        reservedPaths,
+        stats,
+        flushTasks
+      })
+    }
+
+    if (!response['@odata.nextLink']) {
+      break
+    }
+
+    url = parseGraphUrl(response['@odata.nextLink'], 'OneDrive 폴더 다음 페이지 주소가 올바르지 않습니다.')
+  }
 }
 
 function queueDownloadTask(
@@ -3134,7 +3284,7 @@ async function createUniqueDownloadPath(directoryPath: string, fileName: string,
   for (let sequence = 0; sequence < 10_000; sequence += 1) {
     const candidateName = sequence === 0 ? fileName : `${stem} (${sequence})${extension}`
     const candidatePath = join(directoryPath, candidateName)
-    const normalizedCandidatePath = candidatePath.toLowerCase()
+    const normalizedCandidatePath = normalizeLocalPathKey(candidatePath)
 
     if (
       !reservedPaths.has(normalizedCandidatePath) &&
@@ -3146,6 +3296,89 @@ async function createUniqueDownloadPath(directoryPath: string, fileName: string,
   }
 
   throw new Error('중복되지 않는 다운로드 파일 이름을 만들지 못했습니다.')
+}
+
+function normalizeDownloadDirectoryPath(directoryPath: string): string {
+  const trimmedPath = directoryPath.trim()
+
+  if (!trimmedPath) {
+    return ''
+  }
+
+  if (process.platform !== 'win32') {
+    return trimmedPath
+  }
+
+  const driveOnlyMatch = /^([a-zA-Z]):[\\/]?$/.exec(trimmedPath)
+
+  if (driveOnlyMatch?.[1]) {
+    return `${driveOnlyMatch[1].toUpperCase()}:\\`
+  }
+
+  const slashDriveColonMatch = /^\/([a-zA-Z]):[\\/]?(.*)$/.exec(trimmedPath)
+
+  if (slashDriveColonMatch?.[1]) {
+    const restPath = slashDriveColonMatch[2] ? slashDriveColonMatch[2].replace(/[\\/]+/g, '\\') : ''
+    return win32.normalize(`${slashDriveColonMatch[1].toUpperCase()}:\\${restPath}`)
+  }
+
+  const slashDriveRootMatch = /^\/([a-zA-Z])(?:[\\/](.*))?$/.exec(trimmedPath)
+
+  if (slashDriveRootMatch?.[1]) {
+    const restPath = slashDriveRootMatch[2] ? slashDriveRootMatch[2].replace(/[\\/]+/g, '\\') : ''
+    return win32.normalize(`${slashDriveRootMatch[1].toUpperCase()}:\\${restPath}`)
+  }
+
+  return win32.normalize(trimmedPath)
+}
+
+async function ensureLocalDirectory(directoryPath: string, errorMessage: string): Promise<void> {
+  try {
+    const existingStat = await stat(directoryPath)
+
+    if (existingStat.isDirectory()) {
+      return
+    }
+
+    throw new Error('같은 경로에 폴더가 아닌 항목이 이미 있습니다.')
+  } catch (error) {
+    if (!isFileSystemNotFoundError(error)) {
+      throw new Error(`${errorMessage}: ${directoryPath}${formatFileSystemError(error)}`)
+    }
+  }
+
+  try {
+    await mkdir(directoryPath, { recursive: true })
+  } catch (error) {
+    throw new Error(`${errorMessage}: ${directoryPath}${formatFileSystemError(error)}`)
+  }
+}
+
+function isFileSystemNotFoundError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'ENOENT'
+}
+
+function normalizeLocalPathKey(localPath: string): string {
+  const normalizedPath = process.platform === 'win32' ? win32.normalize(localPath) : localPath
+  return normalizedPath.normalize('NFC').toLocaleLowerCase('en-US')
+}
+
+function formatFileSystemError(error: unknown): string {
+  if (!error) {
+    return ''
+  }
+
+  const code =
+    typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : ''
+  const message = error instanceof Error ? error.message : String(error)
+
+  if (!message) {
+    return code ? ` (${code})` : ''
+  }
+
+  return code ? ` (${code}: ${message})` : ` (${message})`
 }
 
 async function pathExists(path: string): Promise<boolean> {
