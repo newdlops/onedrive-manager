@@ -61,6 +61,11 @@ const TRANSFER_DISPATCH_DELAY_MS = 100
 const TRANSFER_RETRY_IDLE_DELAY_MS = 30_000
 const TRANSFER_RETRY_BASE_DELAY_MS = 15_000
 const TRANSFER_RETRY_MAX_DELAY_MS = 30 * 60_000
+const DEFAULT_THROTTLE_RETRY_DELAY_MS = 60_000
+const ADAPTIVE_TRANSFER_SLOT_MIN = 1
+const ADAPTIVE_TRANSFER_SLOT_INITIAL = 4
+const ADAPTIVE_TRANSFER_SLOT_DECREASE_FACTOR = 0.5
+const ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS = 2 * 60_000
 const UPLOAD_QUEUE_BATCH_SIZE = 500
 const COPY_OPERATION_POLL_INTERVAL_MS = 1000
 const COPY_OPERATION_MAX_WAIT_MS = 120_000
@@ -86,9 +91,14 @@ let transferRetryTimerDueAt = 0
 let transferRetryWorkerPromise: Promise<void> | null = null
 let transferRetryProgressListener: DriveTransferProgressListener | undefined
 let transferScanCursor = 0
+let transferThrottleUntil = 0
+let adaptiveTransferSlotLimit: number | null = null
+let lastTransferThrottleAt = 0
+let lastTransferSlotIncreaseAt = 0
 let hasCheckedLegacyDriveTransfers = false
 let transferMetadataMutationPromise: Promise<void> = Promise.resolve()
 const runningTransferIds = new Set<string>()
+const transferWorkerSlotIds = new Set<string>()
 const transferAbortControllers = new Map<string, AbortController>()
 const transferPauseRequests = new Set<string>()
 const transferDeleteRequests = new Set<string>()
@@ -279,7 +289,8 @@ class GraphResponseError extends Error {
   constructor(
     message: string,
     readonly status: number,
-    readonly location: string | null
+    readonly location: string | null,
+    readonly retryAfterMs?: number
   ) {
     super(message)
   }
@@ -901,12 +912,17 @@ export async function resetDriveIndex(): Promise<void> {
 export async function resetDriveTransfers(): Promise<void> {
   stopDriveTransferRetryScheduler()
   runningTransferIds.clear()
+  transferWorkerSlotIds.clear()
   transferAbortControllers.forEach((controller) => controller.abort())
   transferAbortControllers.clear()
   transferPauseRequests.clear()
   transferDeleteRequests.clear()
   transferIndexCache = null
   transferScanCursor = 0
+  transferThrottleUntil = 0
+  adaptiveTransferSlotLimit = null
+  lastTransferThrottleAt = 0
+  lastTransferSlotIncreaseAt = 0
   hasCheckedLegacyDriveTransfers = false
 
   try {
@@ -1197,7 +1213,7 @@ export async function resumeDriveTransfers(taskId?: string, onProgress?: DriveTr
   const resumableTasks = taskId ? (selectedTask && isTransferReadyToRun(selectedTask, true) ? [selectedTask] : []) : await findRetryableTransferTasks(TRANSFER_RETRY_BATCH_LIMIT, true)
 
   for (const task of resumableTasks) {
-    if (!task || runningTransferIds.has(task.id)) {
+    if (!task || transferWorkerSlotIds.has(task.id) || runningTransferIds.has(task.id)) {
       continue
     }
 
@@ -1264,7 +1280,7 @@ export async function deleteDriveTransfer(taskId?: string, onProgress?: DriveTra
     await removeDriveTransferIndexTaskIds(taskIdsToDelete)
     await resetCompletedTransferSummary(activeAccountId)
     for (const taskId of taskIdsToDelete) {
-      if (!runningTransferIds.has(taskId)) {
+      if (!transferWorkerSlotIds.has(taskId) && !runningTransferIds.has(taskId)) {
         transferDeleteRequests.delete(taskId)
         transferPauseRequests.delete(taskId)
       }
@@ -1291,7 +1307,7 @@ export async function deleteDriveTransfer(taskId?: string, onProgress?: DriveTra
   await emitTransferSnapshot(onProgress)
 
   for (const task of tasksToDelete) {
-    if (!runningTransferIds.has(task.id)) {
+    if (!transferWorkerSlotIds.has(task.id) && !runningTransferIds.has(task.id)) {
       transferDeleteRequests.delete(task.id)
       transferPauseRequests.delete(task.id)
     }
@@ -2180,6 +2196,7 @@ async function processAccountTransferTask(task: InternalDriveTransferTask, state
 
     if (task.deleteSourceOnComplete && !task.sourceDeleted) {
       failureStage = 'finalize'
+      await waitForDriveTransferThrottle(abortController.signal)
       await graphSend<void>(createItemUrl(task.sourceItemId), sourceAccessToken, {
         method: 'DELETE',
         signal: abortController.signal
@@ -2214,9 +2231,11 @@ async function processAccountTransferTask(task: InternalDriveTransferTask, state
     await scheduleRetryTransferTask(
       task,
       state,
-      error instanceof Error ? error.message : '계정 간 전송을 완료하지 못했습니다.',
+      getErrorMessage(error, '계정 간 전송을 완료하지 못했습니다.'),
       failureStage,
-      onProgress
+      onProgress,
+      getRetryAfterDelayMs(error),
+      isResponseThrottleError(error)
     )
   } finally {
     runningTransferIds.delete(task.id)
@@ -2324,6 +2343,7 @@ async function processAccountTransferCleanupTask(
   await writeDriveTransferState(state, onProgress)
 
   const sourceAccessToken = await getGraphAccessToken(task.sourceAccountId)
+  await waitForDriveTransferThrottle(signal)
   await graphSend<void>(createItemUrl(task.sourceItemId), sourceAccessToken, {
     method: 'DELETE',
     signal
@@ -2387,10 +2407,12 @@ async function uploadAccountTransferTarget(
   }
 
   const fileSize = Math.max(task.sourceSize ?? sourceSize, 0)
+  await waitForDriveTransferThrottle(signal)
   const targetRootId = await getRootItemId(targetAccessToken)
   const conflictBehavior = task.conflictBehavior ?? 'rename'
 
   if (fileSize === 0) {
+    await waitForDriveTransferThrottle(signal)
     const graphItem = await graphSend<GraphDriveItem>(
       createUploadContentUrlByRootId(targetRootId, task.targetParentId, task.name, conflictBehavior),
       targetAccessToken,
@@ -2437,6 +2459,7 @@ async function uploadAccountTransferTarget(
         throw new Error('계정 간 전송 임시 파일을 읽지 못했습니다.')
       }
 
+      await waitForDriveTransferThrottle(signal)
       const response = await fetch(task.uploadUrl, {
         method: 'PUT',
         headers: {
@@ -2474,7 +2497,7 @@ async function uploadAccountTransferTarget(
         continue
       }
 
-      throw new Error(await formatUploadSessionError(response))
+      throw await createResponseError(response, 'OneDrive 파일 업로드에 실패했습니다.')
     }
   } finally {
     await fileHandle.close()
@@ -2494,6 +2517,7 @@ async function ensureAccountTransferUploadSessionOffset(
   const fileSize = Math.max(task.sourceSize ?? 0, 0)
 
   if (task.uploadUrl && !isExpired(task.expirationDateTime)) {
+    await waitForDriveTransferThrottle(signal)
     const response = await fetch(task.uploadUrl, { signal })
 
     if (response.ok) {
@@ -2506,7 +2530,7 @@ async function ensureAccountTransferUploadSessionOffset(
     }
 
     if (response.status !== 404) {
-      throw new Error(await formatUploadSessionError(response))
+      throw await createResponseError(response, '대상 계정 업로드에 실패했습니다.')
     }
   }
 
@@ -2514,6 +2538,7 @@ async function ensureAccountTransferUploadSessionOffset(
     throw new Error('대상 폴더 정보를 찾지 못했습니다.')
   }
 
+  await waitForDriveTransferThrottle(signal)
   const uploadSession = await graphSend<GraphUploadSessionResponse>(
     createUploadSessionUrlByRootId(targetRootId, task.targetParentId, task.name),
     targetAccessToken,
@@ -2582,12 +2607,14 @@ async function processUploadTask(
     await writeDriveTransferState(state, onProgress)
 
     failureStage = 'metadata'
+    await waitForDriveTransferThrottle(abortController.signal)
     const index = await ensureDriveIndexForListing(false)
     failureStage = 'auth'
     const accessToken = await getGraphAccessToken()
 
     if (task.totalBytes === 0) {
       failureStage = 'upload-chunk'
+      await waitForDriveTransferThrottle(abortController.signal)
       const graphItem = await graphSend<GraphDriveItem>(createUploadContentUrl(index, task.parentId, task.name), accessToken, {
         method: 'PUT',
         headers: {
@@ -2630,6 +2657,7 @@ async function processUploadTask(
         }
 
         failureStage = 'upload-chunk'
+        await waitForDriveTransferThrottle(abortController.signal)
         const response = await fetch(task.uploadUrl, {
           method: 'PUT',
           headers: {
@@ -2674,7 +2702,7 @@ async function processUploadTask(
           continue
         }
 
-        throw new Error(await formatUploadSessionError(response))
+        throw await createResponseError(response, 'OneDrive 파일 업로드에 실패했습니다.')
       }
     } finally {
       await fileHandle.close()
@@ -2691,7 +2719,15 @@ async function processUploadTask(
       throw new TransferPausedError()
     }
 
-    await scheduleRetryTransferTask(task, state, error instanceof Error ? error.message : '업로드를 완료하지 못했습니다.', failureStage, onProgress)
+    await scheduleRetryTransferTask(
+      task,
+      state,
+      getErrorMessage(error, '업로드를 완료하지 못했습니다.'),
+      failureStage,
+      onProgress,
+      getRetryAfterDelayMs(error),
+      isResponseThrottleError(error)
+    )
     return null
   } finally {
     runningTransferIds.delete(task.id)
@@ -2710,6 +2746,7 @@ async function ensureUploadSessionOffset(
   signal?: AbortSignal
 ): Promise<number> {
   if (task.uploadUrl && !isExpired(task.expirationDateTime)) {
+    await waitForDriveTransferThrottle(signal)
     const response = await fetch(task.uploadUrl, { signal })
 
     if (response.ok) {
@@ -2721,10 +2758,11 @@ async function ensureUploadSessionOffset(
     }
 
     if (response.status !== 404) {
-      throw new Error(await formatUploadSessionError(response))
+      throw await createResponseError(response, 'OneDrive 파일 업로드에 실패했습니다.')
     }
   }
 
+  await waitForDriveTransferThrottle(signal)
   const uploadSession = await graphSend<GraphUploadSessionResponse>(createUploadSessionUrl(index, task.parentId ?? '', task.name), accessToken, {
     method: 'POST',
     headers: {
@@ -2859,7 +2897,15 @@ async function processDownloadTask(
       throw new TransferPausedError()
     }
 
-    await scheduleRetryTransferTask(task, state, error instanceof Error ? error.message : '다운로드를 완료하지 못했습니다.', failureStage, onProgress)
+    await scheduleRetryTransferTask(
+      task,
+      state,
+      getErrorMessage(error, '다운로드를 완료하지 못했습니다.'),
+      failureStage,
+      onProgress,
+      getRetryAfterDelayMs(error),
+      isResponseThrottleError(error)
+    )
   } finally {
     runningTransferIds.delete(task.id)
     transferAbortControllers.delete(task.id)
@@ -3177,7 +3223,7 @@ async function graphFetch(url: URL, accessToken: string, init: GraphRequestInit)
   })
 
   if (!response.ok) {
-    throw new GraphResponseError(await formatGraphError(response), response.status, response.headers.get('Location'))
+    throw await createGraphResponseError(response)
   }
 
   return response
@@ -3203,6 +3249,24 @@ async function getRootItemId(accessToken: string): Promise<string> {
   return root.id
 }
 
+async function createGraphResponseError(response: Response): Promise<GraphResponseError> {
+  return new GraphResponseError(
+    await formatGraphError(response),
+    response.status,
+    response.headers.get('Location'),
+    parseRetryAfterMs(response.headers)
+  )
+}
+
+async function createResponseError(response: Response, fallbackMessage: string): Promise<GraphResponseError> {
+  return new GraphResponseError(
+    await formatGenericResponseError(response, fallbackMessage),
+    response.status,
+    response.headers.get('Location'),
+    parseRetryAfterMs(response.headers)
+  )
+}
+
 async function formatGraphError(response: Response): Promise<string> {
   let graphError: GraphErrorResponse | null = null
 
@@ -3224,6 +3288,10 @@ async function formatGraphError(response: Response): Promise<string> {
     return 'OneDrive 인덱스가 만료되어 다시 구성해야 합니다.'
   }
 
+  if (response.status === 429) {
+    return 'OneDrive 요청이 일시적으로 제한되었습니다.'
+  }
+
   if (response.status >= 500) {
     return 'Microsoft Graph 서비스가 응답하지 않습니다. 잠시 후 다시 시도하세요.'
   }
@@ -3231,19 +3299,67 @@ async function formatGraphError(response: Response): Promise<string> {
   return graphError?.error?.message ?? 'OneDrive 파일 목록을 가져오지 못했습니다.'
 }
 
-async function formatUploadSessionError(response: Response): Promise<string> {
+async function formatGenericResponseError(response: Response, fallbackMessage: string): Promise<string> {
+  if (response.status === 429) {
+    return 'OneDrive 요청이 일시적으로 제한되었습니다.'
+  }
+
+  if (response.status >= 500) {
+    return 'OneDrive 서비스가 응답하지 않습니다. 잠시 후 다시 시도하세요.'
+  }
+
   try {
     const graphError = (await response.json()) as GraphErrorResponse
 
-    return graphError.error?.message ?? 'OneDrive 파일 업로드에 실패했습니다.'
+    return graphError.error?.message ?? fallbackMessage
   } catch {
-    return 'OneDrive 파일 업로드에 실패했습니다.'
+    return fallbackMessage
   }
+}
+
+function parseRetryAfterMs(headers: Headers): number | undefined {
+  const retryAfterMs = parsePositiveDelayMs(headers.get('x-ms-retry-after-ms'))
+
+  if (retryAfterMs !== undefined) {
+    return retryAfterMs
+  }
+
+  const retryAfter = headers.get('Retry-After')
+  const retryAfterSeconds = Number(retryAfter)
+
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.ceil(retryAfterSeconds * 1000)
+  }
+
+  if (retryAfter) {
+    const retryAt = Date.parse(retryAfter)
+
+    if (Number.isFinite(retryAt)) {
+      return Math.max(TRANSFER_DISPATCH_DELAY_MS, retryAt - Date.now())
+    }
+  }
+
+  return undefined
+}
+
+function parsePositiveDelayMs(value: string | null): number | undefined {
+  if (!value) {
+    return undefined
+  }
+
+  const delayMs = Number(value)
+
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return undefined
+  }
+
+  return Math.ceil(delayMs)
 }
 
 async function createDownloadResponse(itemId: string, offset: number, signal?: AbortSignal, accessToken?: string): Promise<Response> {
   const token = accessToken ?? (await getGraphAccessToken())
   const rangeHeader: Record<string, string> = offset > 0 ? { Range: `bytes=${offset}-` } : {}
+  await waitForDriveTransferThrottle(signal)
   const graphResponse = await fetch(createDownloadContentUrl(itemId), {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -3260,10 +3376,20 @@ async function createDownloadResponse(itemId: string, offset: number, signal?: A
       throw new Error('다운로드 주소를 가져오지 못했습니다.')
     }
 
-    return fetch(location, {
+    const downloadResponse = await fetch(location, {
       headers: rangeHeader,
       signal
     })
+
+    if (!downloadResponse.ok) {
+      throw await createResponseError(downloadResponse, 'OneDrive 파일을 다운로드하지 못했습니다.')
+    }
+
+    return downloadResponse
+  }
+
+  if (!graphResponse.ok) {
+    throw await createGraphResponseError(graphResponse)
   }
 
   return graphResponse
@@ -3467,6 +3593,7 @@ async function removeCompletedDriveTransferTask(task: InternalDriveTransferTask,
   await removeDriveTransferIndexTaskIds([task.id])
   await resetCompletedTransferSummaryIfQueueFinished(task)
   transferScanCursor = 0
+  await recordSuccessfulTransferCompletion()
   await emitTransferSnapshot(onProgress)
 }
 
@@ -3534,11 +3661,17 @@ async function scheduleRetryTransferTask(
   state: DriveTransferState,
   message: string,
   failureStage: TransferFailureStage,
-  onProgress?: DriveTransferProgressListener
+  onProgress?: DriveTransferProgressListener,
+  retryAfterDelayMs?: number,
+  shouldThrottleTransfers = false
 ): Promise<void> {
   const attemptCount = (task.attemptCount ?? 0) + 1
-  const retryDelayMs = getRetryDelayMs(attemptCount)
+  const retryDelayMs = getRetryDelayMs(attemptCount, retryAfterDelayMs)
   const nextRetryAt = new Date(Date.now() + retryDelayMs).toISOString()
+
+  if (shouldThrottleTransfers) {
+    await throttleDriveTransfers(retryDelayMs)
+  }
 
   task.status = 'retrying'
   task.bytesPerSecond = 0
@@ -3553,12 +3686,105 @@ async function scheduleRetryTransferTask(
   scheduleDriveTransferRetryWorker(retryDelayMs)
 }
 
-function getRetryDelayMs(attemptCount: number): number {
+function getRetryDelayMs(attemptCount: number, minimumDelayMs?: number): number {
   const exponentialDelayMs = TRANSFER_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attemptCount - 1)
   const cappedDelayMs = Math.min(exponentialDelayMs, TRANSFER_RETRY_MAX_DELAY_MS)
   const jitterMs = Math.floor(Math.random() * Math.min(5000, cappedDelayMs / 3))
 
-  return cappedDelayMs + jitterMs
+  return Math.max(cappedDelayMs + jitterMs, minimumDelayMs ?? 0)
+}
+
+async function throttleDriveTransfers(delayMs: number): Promise<void> {
+  const now = Date.now()
+  const settings = await getTransferSettings()
+  const configuredSlotLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, settings.maxConcurrentTransfers)
+  const currentSlotLimit = getEffectiveTransferSlotLimit(configuredSlotLimit)
+  const reducedSlotLimit = Math.max(
+    ADAPTIVE_TRANSFER_SLOT_MIN,
+    Math.ceil(currentSlotLimit * ADAPTIVE_TRANSFER_SLOT_DECREASE_FACTOR)
+  )
+
+  adaptiveTransferSlotLimit = Math.min(configuredSlotLimit, reducedSlotLimit)
+  lastTransferThrottleAt = now
+  lastTransferSlotIncreaseAt = Math.max(lastTransferSlotIncreaseAt, now)
+  transferThrottleUntil = Math.max(transferThrottleUntil, now + Math.max(delayMs, TRANSFER_DISPATCH_DELAY_MS))
+}
+
+function getDriveTransferThrottleDelayMs(): number {
+  return Math.max(0, transferThrottleUntil - Date.now())
+}
+
+async function waitForDriveTransferThrottle(signal?: AbortSignal): Promise<void> {
+  const delayMs = getDriveTransferThrottleDelayMs()
+
+  if (delayMs <= 0) {
+    return
+  }
+
+  await waitForDelay(delayMs, signal)
+}
+
+async function waitForDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw createAbortError()
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      signal?.removeEventListener('abort', handleAbort)
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, delayMs)
+    const handleAbort = (): void => {
+      clearTimeout(timer)
+      cleanup()
+      reject(createAbortError())
+    }
+
+    signal?.addEventListener('abort', handleAbort, { once: true })
+  })
+}
+
+function createAbortError(): Error {
+  const error = new Error('전송이 중지되었습니다.')
+  error.name = 'AbortError'
+  return error
+}
+
+async function recordSuccessfulTransferCompletion(): Promise<void> {
+  const now = Date.now()
+  const settings = await getTransferSettings()
+  const configuredSlotLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, settings.maxConcurrentTransfers)
+  const currentSlotLimit = getEffectiveTransferSlotLimit(configuredSlotLimit)
+
+  if (currentSlotLimit >= configuredSlotLimit) {
+    return
+  }
+
+  if (now - lastTransferThrottleAt < ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS) {
+    return
+  }
+
+  if (now - lastTransferSlotIncreaseAt < ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS) {
+    return
+  }
+
+  adaptiveTransferSlotLimit = Math.min(configuredSlotLimit, currentSlotLimit + 1)
+  lastTransferSlotIncreaseAt = now
+
+  scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
+}
+
+function getEffectiveTransferSlotLimit(configuredSlotLimit: number): number {
+  const normalizedConfiguredLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, Math.floor(configuredSlotLimit))
+
+  if (adaptiveTransferSlotLimit === null) {
+    return Math.min(normalizedConfiguredLimit, ADAPTIVE_TRANSFER_SLOT_INITIAL)
+  }
+
+  return Math.min(normalizedConfiguredLimit, Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, Math.floor(adaptiveTransferSlotLimit)))
 }
 
 function scheduleDriveTransferRetryWorker(delayMs = TRANSFER_RETRY_IDLE_DELAY_MS): void {
@@ -3598,6 +3824,13 @@ async function runDriveTransferRetryWorker(): Promise<void> {
   let startedCount = 0
 
   transferRetryWorkerPromise = (async () => {
+    const throttleDelayMs = getDriveTransferThrottleDelayMs()
+
+    if (throttleDelayMs > 0) {
+      scheduleDriveTransferRetryWorker(throttleDelayMs)
+      return
+    }
+
     const availableSlots = await getAvailableTransferSlots()
 
     if (availableSlots <= 0) {
@@ -3607,13 +3840,19 @@ async function runDriveTransferRetryWorker(): Promise<void> {
     const tasks = await findRetryableTransferTasks(Math.min(TRANSFER_RETRY_BATCH_LIMIT, availableSlots), false)
 
     for (const task of tasks) {
-      if (task.status !== 'paused') {
+      if (task.status !== 'paused' && (await startDriveTransferTask(task, transferRetryProgressListener))) {
         startedCount += 1
-        startDriveTransferTask(task, transferRetryProgressListener)
       }
     }
   })().finally(async () => {
     transferRetryWorkerPromise = null
+
+    const throttleDelayMs = getDriveTransferThrottleDelayMs()
+
+    if (throttleDelayMs > 0) {
+      scheduleDriveTransferRetryWorker(throttleDelayMs)
+      return
+    }
 
     if ((await getAvailableTransferSlots()) <= 0) {
       return
@@ -3624,7 +3863,7 @@ async function runDriveTransferRetryWorker(): Promise<void> {
       return
     }
 
-    if (runningTransferIds.size === 0) {
+    if (getOccupiedTransferSlotCount() === 0) {
       scheduleDriveTransferRetryWorker(TRANSFER_RETRY_IDLE_DELAY_MS)
     }
   })
@@ -3634,18 +3873,35 @@ async function runDriveTransferRetryWorker(): Promise<void> {
 
 async function getAvailableTransferSlots(): Promise<number> {
   const settings = await getTransferSettings()
+  const effectiveSlotLimit = getEffectiveTransferSlotLimit(settings.maxConcurrentTransfers)
 
-  return Math.max(0, settings.maxConcurrentTransfers - runningTransferIds.size)
+  return Math.max(0, effectiveSlotLimit - getOccupiedTransferSlotCount())
 }
 
-function startDriveTransferTask(task: InternalDriveTransferTask, onProgress?: DriveTransferProgressListener): void {
+function getOccupiedTransferSlotCount(): number {
+  return new Set([...transferWorkerSlotIds, ...runningTransferIds]).size
+}
+
+async function startDriveTransferTask(task: InternalDriveTransferTask, onProgress?: DriveTransferProgressListener): Promise<boolean> {
+  if (transferWorkerSlotIds.has(task.id) || runningTransferIds.has(task.id)) {
+    return false
+  }
+
+  if ((await getAvailableTransferSlots()) <= 0) {
+    return false
+  }
+
+  transferWorkerSlotIds.add(task.id)
   void runDriveTransferTask(task, onProgress)
     .catch(() => {
       // The task file records retry, pause, and failure details.
     })
     .finally(() => {
+      transferWorkerSlotIds.delete(task.id)
       scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
     })
+
+  return true
 }
 
 async function runDriveTransferTask(task: InternalDriveTransferTask, onProgress?: DriveTransferProgressListener): Promise<void> {
@@ -3702,6 +3958,26 @@ function formatRetryDelay(delayMs: number): string {
   }
 
   return `${Math.round(seconds / 60)}분`
+}
+
+function getErrorMessage(error: unknown, fallbackMessage: string): string {
+  return error instanceof Error ? error.message : fallbackMessage
+}
+
+function getRetryAfterDelayMs(error: unknown): number | undefined {
+  if (!(error instanceof GraphResponseError)) {
+    return undefined
+  }
+
+  if (error.retryAfterMs !== undefined) {
+    return Math.max(TRANSFER_DISPATCH_DELAY_MS, error.retryAfterMs)
+  }
+
+  return error.status === 429 ? DEFAULT_THROTTLE_RETRY_DELAY_MS : undefined
+}
+
+function isResponseThrottleError(error: unknown): boolean {
+  return error instanceof GraphResponseError && (error.status === 429 || error.retryAfterMs !== undefined)
 }
 
 function throwIfTransferPaused(taskId: string): void {
@@ -4111,7 +4387,7 @@ async function readDriveTransferTask(taskId: string): Promise<InternalDriveTrans
       return null
     }
 
-    if (task.status === 'running' && !runningTransferIds.has(task.id)) {
+    if (task.status === 'running' && !transferWorkerSlotIds.has(task.id) && !runningTransferIds.has(task.id)) {
       task.status = 'retrying'
       task.bytesPerSecond = 0
       task.message = '앱이 종료되어 전송이 끊겼습니다. 자동으로 다시 시도합니다.'
@@ -4162,7 +4438,7 @@ async function findRetryableTransferTasks(limit: number, includePaused: boolean)
     transferScanCursor = (transferScanCursor + 1) % index.taskIds.length
     scannedCount += 1
 
-    if (!taskId || runningTransferIds.has(taskId)) {
+    if (!taskId || transferWorkerSlotIds.has(taskId) || runningTransferIds.has(taskId)) {
       continue
     }
 
@@ -4185,7 +4461,7 @@ function isDriveTransferTaskForAccount(task: InternalDriveTransferTask, activeAc
 }
 
 function isTransferReadyToRun(task: InternalDriveTransferTask, includePaused: boolean): boolean {
-  if (task.status === 'completed' || runningTransferIds.has(task.id)) {
+  if (task.status === 'completed' || transferWorkerSlotIds.has(task.id) || runningTransferIds.has(task.id)) {
     return false
   }
 
