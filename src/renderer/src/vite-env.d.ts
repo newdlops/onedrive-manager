@@ -23,6 +23,13 @@ import type {
   DriveFolderReconcileResult,
   DriveIndexStatus,
   DriveIndexWarmRequest,
+  DriveSettings,
+  DriveSettingsInput,
+  DriveSearchRequest,
+  DriveSearchResult,
+  DriveThumbnailRequest,
+  DriveThumbnailResult,
+  GraphActivityEvent,
   MicrosoftAuthSettings,
   MicrosoftAuthSettingsInput,
   MoveDriveItemsRequest,
@@ -45,6 +52,8 @@ declare global {
       updateMicrosoftAuthSettings: (input: MicrosoftAuthSettingsInput) => Promise<MicrosoftAuthSettings>
       getTransferSettings: () => Promise<TransferSettings>
       updateTransferSettings: (input: TransferSettingsInput) => Promise<TransferSettings>
+      getDriveSettings: () => Promise<DriveSettings>
+      updateDriveSettings: (input: DriveSettingsInput) => Promise<DriveSettings>
       getAuthSession: () => Promise<AuthSession>
       listAccountUsage: () => Promise<DriveAccountUsage[]>
       connectAccount: () => Promise<AuthSession>
@@ -53,6 +62,8 @@ declare global {
       resetAllSettings: () => Promise<AuthSession>
       listDriveChildren: (request: DriveChildrenRequest) => Promise<DriveChildrenResult>
       warmDriveIndex: (request?: DriveIndexWarmRequest) => Promise<DriveIndexStatus>
+      searchDriveItems: (request: DriveSearchRequest) => Promise<DriveSearchResult>
+      getDriveThumbnail: (request: DriveThumbnailRequest) => Promise<DriveThumbnailResult>
       compareDriveFolders: (request: DriveFolderCompareRequest) => Promise<DriveFolderCompareResult>
       reconcileDriveFolders: (request: DriveFolderReconcileRequest) => Promise<DriveFolderReconcileResult>
       renameDriveItem: (request: RenameDriveItemRequest) => Promise<CloudDriveItem>
@@ -73,6 +84,7 @@ declare global {
       stopTransfer: (taskId: string) => Promise<DriveTransferTask[]>
       deleteTransfer: (taskId?: string) => Promise<DriveTransferTask[]>
       onTransfersUpdated: (callback: (tasks: DriveTransferTask[]) => void) => () => void
+      onGraphActivity: (callback: (event: GraphActivityEvent) => void) => () => void
     }
   }
 }

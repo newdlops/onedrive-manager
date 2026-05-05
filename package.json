@@ -1,6 +1,6 @@
 {
   "name": "onedrive-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-platform Electron desktop app for managing Microsoft OneDrive.",
   "main": "./out/main/index.js",
   "private": true,
@@ -12,7 +12,7 @@
     "build": "npm run typecheck && electron-vite build",
     "package": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
-    "dist:mac": "npm run build && electron-builder --mac --x64 --arm64",
+    "dist:mac": "npm run build && electron-builder --mac dmg --universal",
     "dist:win": "npm run build && electron-builder --win --x64 --arm64"
   },
   "dependencies": {

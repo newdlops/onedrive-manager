@@ -3,11 +3,28 @@ import { Buffer } from 'node:buffer'
 import { createWriteStream } from 'node:fs'
 import { mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, extname, join, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { getActiveAccountId, getGraphAccessToken } from '../auth/microsoftAuth'
-import { getTransferSettings } from '../settings'
+import { getDriveSettings, getTransferSettings } from '../settings'
+import {
+  appendDriveDeltaStaging,
+  clearDriveDeltaStaging,
+  closeDriveIndexStores,
+  createEmptyDriveIndex,
+  findDriveIndexChildByName,
+  getDriveIndexStoreDirectory,
+  getLegacyAccountDriveIndexPath,
+  listDriveIndexChildren,
+  readDriveIndexFromStore,
+  readLastOccurrenceDriveDeltaStaging,
+  resetDriveDeltaStaging,
+  searchDriveIndexItems,
+  writeDriveIndexToStore,
+  type DriveIndex,
+  type DriveDeltaStagePayload
+} from './driveIndexStore'
 import type {
   AuthAccount,
   CloudDriveItem,
@@ -34,6 +51,12 @@ import type {
   DriveChildrenRequest,
   DriveChildrenResult,
   DriveIndexStatus,
+  DriveSearchRequest,
+  DriveSearchResult,
+  DriveThumbnailRequest,
+  DriveThumbnailResult,
+  DriveThumbnailSize,
+  GraphActivityEvent,
   MoveDriveItemsRequest,
   RenameDriveItemRequest,
   TransferDriveItemRef,
@@ -43,32 +66,52 @@ import type {
 
 const GRAPH_BASE_URL = 'https://graph.microsoft.com/v1.0'
 const DRIVE_INDEX_LEGACY_FILE_NAME = 'drive-index.json'
-const DRIVE_INDEXES_DIR_NAME = 'drive-indexes'
 const DRIVE_TRANSFERS_LEGACY_FILE_NAME = 'drive-transfers.json'
 const DRIVE_TRANSFERS_DIR_NAME = 'drive-transfers'
 const DRIVE_TRANSFERS_INDEX_FILE_NAME = 'index.json'
 const DRIVE_TRANSFERS_SUMMARY_FILE_NAME = 'summary.json'
 const DRIVE_TRANSFERS_TASKS_DIR_NAME = 'tasks'
 const DRIVE_TRANSFERS_TEMP_DIR_NAME = 'temp'
+const DRIVE_THUMBNAIL_CACHE_DIR_NAME = 'drive-thumbnails'
 const INDEX_FRESH_MS = 60_000
-const DRIVE_ITEM_SELECT = 'id,name,size,lastModifiedDateTime,webUrl,parentReference,folder,file,package,deleted'
+const DRIVE_ITEM_SELECT = 'id,name,size,lastModifiedDateTime,webUrl,parentReference,folder,file,package,deleted,cTag,eTag'
 const UPLOAD_CHUNK_SIZE_BYTES = 10 * 1024 * 1024
 const TRANSFER_PROGRESS_SAVE_INTERVAL_MS = 3_000
 const TRANSFER_VISIBLE_LIMIT = 100
 const TRANSFER_LIST_MAX_LIMIT = 500
-const TRANSFER_RETRY_BATCH_LIMIT = 8
+const TRANSFER_RETRY_BATCH_LIMIT = 64
 const TRANSFER_DISPATCH_DELAY_MS = 100
 const TRANSFER_RETRY_IDLE_DELAY_MS = 30_000
-const TRANSFER_RETRY_BASE_DELAY_MS = 15_000
+const TRANSFER_RETRY_READY_WAIT_MS = 5_000
+const TRANSFER_RETRY_STEP_DELAY_MS = 5_000
+const TRANSFER_RETRY_BASE_DELAY_MS = 5_000
 const TRANSFER_RETRY_MAX_DELAY_MS = 30 * 60_000
 const DEFAULT_THROTTLE_RETRY_DELAY_MS = 60_000
-const ADAPTIVE_TRANSFER_SLOT_MIN = 1
-const ADAPTIVE_TRANSFER_SLOT_INITIAL = 4
-const ADAPTIVE_TRANSFER_SLOT_DECREASE_FACTOR = 0.5
-const ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS = 2 * 60_000
+const TRANSFER_SLOT_MIN = 1
 const UPLOAD_QUEUE_BATCH_SIZE = 500
 const COPY_OPERATION_POLL_INTERVAL_MS = 1000
 const COPY_OPERATION_MAX_WAIT_MS = 120_000
+const DRIVE_THUMBNAIL_DEFAULT_SIZE: DriveThumbnailSize = 'c160x120_crop'
+const DRIVE_THUMBNAIL_BATCH_LIMIT_MIN = 4
+const DRIVE_THUMBNAIL_BATCH_LIMIT_INITIAL = 10
+const DRIVE_THUMBNAIL_BATCH_LIMIT_MAX = 20
+const DRIVE_THUMBNAIL_BATCH_DELAY_MS = 24
+const DRIVE_THUMBNAIL_BATCH_STEP_DELAY_INITIAL_MS = 120
+const DRIVE_THUMBNAIL_BATCH_STEP_DELAY_MIN_MS = 24
+const DRIVE_THUMBNAIL_BATCH_STEP_DELAY_MAX_MS = 2_000
+const DRIVE_THUMBNAIL_ADAPTIVE_SUCCESS_TARGET = 60
+const DRIVE_THUMBNAIL_URL_CACHE_MS = 20 * 60_000
+const DRIVE_THUMBNAIL_MISSING_CACHE_MS = 5 * 60_000
+const DRIVE_THUMBNAIL_MAX_RETRIES = 3
+const DRIVE_THUMBNAIL_RETRY_BASE_DELAY_MS = 5_000
+const DRIVE_THUMBNAIL_RETRY_MAX_DELAY_MS = 5 * 60_000
+const DRIVE_THUMBNAIL_DISK_CACHE_MS = 30 * 24 * 60 * 60_000
+const DRIVE_THUMBNAIL_MAX_CACHE_BYTES = 5 * 1024 * 1024
+const DRIVE_THUMBNAIL_DEFAULT_CONTENT_TYPE = 'image/jpeg'
+const DRIVE_THUMBNAIL_WARM_BATCH_SIZE = 500
+const DRIVE_THUMBNAIL_WARM_BATCH_DELAY_MS = 100
+const DRIVE_THUMBNAIL_IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'heic', 'heif', 'jpeg', 'jpg', 'png', 'tif', 'tiff', 'webp'])
+const DRIVE_THUMBNAIL_VIDEO_EXTENSIONS = new Set(['avi', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'webm', 'wmv'])
 const DRIVE_ITEM_TYPE_ORDER: Record<CloudDriveItemType, number> = {
   folder: 0,
   package: 1,
@@ -81,7 +124,7 @@ const DRIVE_ITEM_NAME_COLLATOR = new Intl.Collator('ko-KR', {
 
 type GraphConflictBehavior = 'rename' | 'replace'
 
-let driveIndexSyncPromise: Promise<DriveIndex> | null = null
+const driveIndexSyncPromises = new Map<string, Promise<DriveIndex>>()
 let activeDriveIndexSnapshot: DriveIndex | null = null
 let activeDriveIndexSnapshotAccountId: string | null = null
 let driveIndexGeneration = 0
@@ -92,9 +135,7 @@ let transferRetryWorkerPromise: Promise<void> | null = null
 let transferRetryProgressListener: DriveTransferProgressListener | undefined
 let transferScanCursor = 0
 let transferThrottleUntil = 0
-let adaptiveTransferSlotLimit: number | null = null
-let lastTransferThrottleAt = 0
-let lastTransferSlotIncreaseAt = 0
+let nextRetryingTransferDispatchAt = 0
 let hasCheckedLegacyDriveTransfers = false
 let transferMetadataMutationPromise: Promise<void> = Promise.resolve()
 const runningTransferIds = new Set<string>()
@@ -102,15 +143,18 @@ const transferWorkerSlotIds = new Set<string>()
 const transferAbortControllers = new Map<string, AbortController>()
 const transferPauseRequests = new Set<string>()
 const transferDeleteRequests = new Set<string>()
-
-type DriveIndex = {
-  version: 1
-  rootItemId?: string
-  deltaLink?: string
-  syncedAt?: string
-  expandedFolderIds: Record<string, true>
-  items: Record<string, CloudDriveItem>
-}
+const driveThumbnailCache = new Map<string, { result: DriveThumbnailResult; expiresAtMs: number }>()
+const driveThumbnailPendingRequests = new Map<string, Promise<DriveThumbnailResult>>()
+const driveThumbnailWarmPromises = new Map<string, Promise<void>>()
+const driveThumbnailWarmSignatures = new Map<string, string>()
+const driveThumbnailQueue: DriveThumbnailQueueEntry[] = []
+let driveThumbnailQueueTimer: ReturnType<typeof setTimeout> | null = null
+let driveThumbnailQueueFlushPromise: Promise<void> | null = null
+let driveThumbnailThrottleUntil = 0
+let driveThumbnailBatchLimit = DRIVE_THUMBNAIL_BATCH_LIMIT_INITIAL
+let driveThumbnailBatchStepDelayMs = DRIVE_THUMBNAIL_BATCH_STEP_DELAY_INITIAL_MS
+let driveThumbnailSuccessfulItemCount = 0
+let graphActivityListener: ((event: GraphActivityEvent) => void) | null = null
 
 type GraphDriveRoot = {
   id?: string
@@ -157,10 +201,48 @@ type GraphUploadSessionResponse = {
   nextExpectedRanges?: string[]
 }
 
+type GraphThumbnail = {
+  height?: number
+  width?: number
+  url?: string
+}
+
+type GraphThumbnailSet = {
+  id?: string
+  [key: string]: unknown
+}
+
+type GraphThumbnailResponse = {
+  value?: GraphThumbnailSet[]
+}
+
+type GraphBatchThumbnailResponse = {
+  responses?: GraphBatchThumbnailItemResponse[]
+}
+
+type GraphBatchThumbnailItemResponse = {
+  id?: string
+  status?: number
+  headers?: Record<string, string>
+  body?: unknown
+}
+
+type DriveThumbnailDiskCacheEntry = {
+  version: 1
+  itemId: string
+  contentType: string
+  width?: number
+  height?: number
+  createdAtMs: number
+  expiresAtMs: number
+}
+
 type GraphDriveItem = {
   id?: string
   name?: string
   size?: number
+  cTag?: string
+  eTag?: string
   lastModifiedDateTime?: string
   webUrl?: string
   parentReference?: {
@@ -240,14 +322,14 @@ type InternalDriveTransferTask = DriveTransferTask & {
   speedSampleAt?: number
 }
 
-type DriveItemContentHashes = {
+type DriveItemContentFingerprint = {
   quickXorHash?: string
-  sha1Hash?: string
-  sha256Hash?: string
+  cTag?: string
+  eTag?: string
 }
 
 type InternalFolderCompareItem = DriveFolderCompareItem & {
-  contentHashes?: DriveItemContentHashes
+  contentFingerprint?: DriveItemContentFingerprint
 }
 
 type DriveTransferProgressListener = (tasks: DriveTransferTask[]) => void
@@ -262,6 +344,13 @@ type TransferFailureStage =
   | 'download-stream'
   | 'finalize'
   | 'unknown'
+
+type TransferRetryCandidateMode = 'any' | 'non-retrying' | 'retrying'
+
+type TransferRetryCandidateOptions = {
+  mode?: TransferRetryCandidateMode
+  minimumRetryingWaitMs?: number
+}
 
 type LocalUploadFile = {
   parentId: string
@@ -302,7 +391,49 @@ class TransferPausedError extends Error {
   }
 }
 
+type InternalDriveThumbnailRequest = {
+  accountId: string | null
+  itemId: string
+  cacheKey: string
+  priority: 'normal' | 'high'
+  size: DriveThumbnailSize
+  cacheOnly: boolean
+}
+
+type DriveThumbnailQueueEntry = {
+  request: InternalDriveThumbnailRequest
+  cacheKey: string
+  attemptCount: number
+  resolve: (result: DriveThumbnailResult) => void
+  reject: (error: unknown) => void
+}
+
+type DriveThumbnailBatchOutcome =
+  | {
+      status: 'fulfilled'
+      result: DriveThumbnailResult
+    }
+  | {
+      status: 'rejected'
+      reason: unknown
+    }
+
+type GraphActivityInput = Omit<GraphActivityEvent, 'id' | 'at'>
+
+export function setGraphActivityListener(listener: ((event: GraphActivityEvent) => void) | null): void {
+  graphActivityListener = listener
+}
+
+function emitGraphActivity(input: GraphActivityInput): void {
+  graphActivityListener?.({
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    ...input
+  })
+}
+
 export async function listDriveChildren(request: DriveChildrenRequest): Promise<DriveChildrenResult> {
+  const accountId = await getActiveAccountId()
   const index = await ensureDriveIndexForListing(request.forceRefresh ?? false)
   const parentId = request.folderId ?? index.rootItemId
 
@@ -312,22 +443,88 @@ export async function listDriveChildren(request: DriveChildrenRequest): Promise<
 
   const currentIndex =
     request.forceRefresh || !isFolderLocallyNavigable(index, parentId) ? await fetchAndMergeFolderChildren(index, parentId) : index
+  const storedChildren = await listDriveIndexChildren(accountId, parentId)
 
   return {
     folderId: request.folderId ?? null,
-    items: sortDriveItems(Object.values(currentIndex.items).filter((item) => item.parentId === parentId))
+    items: sortDriveItems(storedChildren.length > 0 ? storedChildren : Object.values(currentIndex.items).filter((item) => item.parentId === parentId))
   }
 }
 
 export async function warmDriveIndex(forceSync = false): Promise<DriveIndexStatus> {
   const accountId = await getActiveAccountId()
   const currentIndex = await getCurrentDriveIndex(accountId)
+  const driveSettings = await getDriveSettings()
 
-  if ((forceSync || !isIndexReadyAndFresh(currentIndex)) && !driveIndexSyncPromise) {
+  if ((forceSync || (driveSettings.indexMode === 'automatic' && !isIndexReadyAndFresh(currentIndex))) && !isDriveIndexSyncing(accountId)) {
+    emitGraphActivity({
+      level: 'info',
+      scope: 'index',
+      title: '탐색 인덱스 동기화 시작',
+      message: forceSync ? '수동 요청으로 OneDrive 전체 인덱스를 갱신합니다.' : 'OneDrive 탐색 인덱스를 백그라운드로 갱신합니다.'
+    })
     startDriveIndexSync(currentIndex, accountId)
   }
 
-  return createDriveIndexStatus(activeDriveIndexSnapshotAccountId === accountId ? activeDriveIndexSnapshot ?? currentIndex : currentIndex)
+  const statusIndex = activeDriveIndexSnapshotAccountId === accountId ? activeDriveIndexSnapshot ?? currentIndex : currentIndex
+
+  if (isIndexUsable(statusIndex) && !isDriveIndexSyncing(accountId)) {
+    startDriveThumbnailCacheWarmup(statusIndex, accountId)
+  }
+
+  return createDriveIndexStatus(statusIndex, accountId)
+}
+
+export async function searchDriveItems(request: DriveSearchRequest): Promise<DriveSearchResult> {
+  const accountId = await getActiveAccountId()
+  await ensureDriveIndexForListing(false)
+
+  return {
+    items: await searchDriveIndexItems(accountId, request?.query ?? '', request?.limit ?? 100)
+  }
+}
+
+export async function getDriveItemThumbnail(request: DriveThumbnailRequest): Promise<DriveThumbnailResult> {
+  const normalizedRequest = await normalizeDriveThumbnailRequest(request)
+  const cacheKey = createDriveThumbnailCacheKey(normalizedRequest)
+
+  if (normalizedRequest.cacheOnly) {
+    if (await hasFreshDriveThumbnailDiskCache(cacheKey, normalizedRequest.itemId)) {
+      return {
+        itemId: normalizedRequest.itemId,
+        status: 'ready'
+      }
+    }
+  } else {
+    const cached = driveThumbnailCache.get(cacheKey)
+
+    if (cached && cached.expiresAtMs > Date.now()) {
+      return cached.result
+    }
+
+    const diskCached = await readCachedDriveThumbnailResult(cacheKey, normalizedRequest.itemId)
+
+    if (diskCached) {
+      cacheDriveThumbnailResult(cacheKey, diskCached)
+      return diskCached
+    }
+  }
+
+  const pendingKey = createDriveThumbnailPendingKey(normalizedRequest, cacheKey)
+  const pendingRequest = driveThumbnailPendingRequests.get(pendingKey)
+
+  if (pendingRequest) {
+    return pendingRequest
+  }
+
+  const requestPromise = enqueueDriveThumbnailRequest(normalizedRequest, cacheKey)
+  driveThumbnailPendingRequests.set(pendingKey, requestPromise)
+
+  try {
+    return await requestPromise
+  } finally {
+    driveThumbnailPendingRequests.delete(pendingKey)
+  }
 }
 
 export async function compareDriveFolders(request: DriveFolderCompareRequest): Promise<DriveFolderCompareResult> {
@@ -469,21 +666,23 @@ function createFolderCompareItem(item: CloudDriveItem, graphItem: GraphDriveItem
     type: item.type,
     size: item.size,
     lastModifiedDateTime: item.lastModifiedDateTime,
-    contentHashes: getGraphItemContentHashes(graphItem)
+    contentFingerprint: getGraphItemContentFingerprint(graphItem)
   }
 }
 
-function getGraphItemContentHashes(item: GraphDriveItem): DriveItemContentHashes | undefined {
-  const hashes = item.file?.hashes
+function getGraphItemContentFingerprint(item: GraphDriveItem): DriveItemContentFingerprint | undefined {
+  const quickXorHash = normalizeContentHash(item.file?.hashes?.quickXorHash)
+  const cTag = normalizeContentHash(item.cTag)
+  const eTag = normalizeContentHash(item.eTag)
 
-  if (!hashes) {
+  if (!quickXorHash && !cTag && !eTag) {
     return undefined
   }
 
   return {
-    quickXorHash: normalizeContentHash(hashes.quickXorHash),
-    sha1Hash: normalizeContentHash(hashes.sha1Hash),
-    sha256Hash: normalizeContentHash(hashes.sha256Hash)
+    quickXorHash,
+    cTag,
+    eTag
   }
 }
 
@@ -524,24 +723,24 @@ function getFolderCompareDifferenceReasons(
     return reasons
   }
 
-  if (hasDifferentCommonContentHash(sourceItem.contentHashes, targetItem.contentHashes)) {
+  if (hasDifferentCommonContentFingerprint(sourceItem.contentFingerprint, targetItem.contentFingerprint)) {
     reasons.push('content')
   }
 
   return reasons
 }
 
-function hasDifferentCommonContentHash(
-  sourceHashes: DriveItemContentHashes | undefined,
-  targetHashes: DriveItemContentHashes | undefined
+function hasDifferentCommonContentFingerprint(
+  sourceFingerprint: DriveItemContentFingerprint | undefined,
+  targetFingerprint: DriveItemContentFingerprint | undefined
 ): boolean {
-  if (!sourceHashes || !targetHashes) {
+  if (!sourceFingerprint || !targetFingerprint) {
     return false
   }
 
-  for (const key of ['sha256Hash', 'sha1Hash', 'quickXorHash'] as const) {
-    if (sourceHashes[key] && targetHashes[key]) {
-      return sourceHashes[key] !== targetHashes[key]
+  for (const key of ['quickXorHash', 'cTag', 'eTag'] as const) {
+    if (sourceFingerprint[key] && targetFingerprint[key]) {
+      return sourceFingerprint[key] !== targetFingerprint[key]
     }
   }
 
@@ -893,16 +1092,17 @@ export async function listDriveAccountUsage(accounts: AuthAccount[]): Promise<Dr
 
 export async function clearDriveIndexMemory(): Promise<void> {
   driveIndexGeneration += 1
-  driveIndexSyncPromise = null
+  driveIndexSyncPromises.clear()
   activeDriveIndexSnapshot = null
   activeDriveIndexSnapshotAccountId = null
 }
 
 export async function resetDriveIndex(): Promise<void> {
   await clearDriveIndexMemory()
+  closeDriveIndexStores()
 
   try {
-    await rm(getDriveIndexesDirectory(), { recursive: true, force: true })
+    await rm(getDriveIndexStoreDirectory(), { recursive: true, force: true })
     await unlink(getLegacyDriveIndexPath())
   } catch {
     // Index file may not exist on a fresh install.
@@ -920,9 +1120,7 @@ export async function resetDriveTransfers(): Promise<void> {
   transferIndexCache = null
   transferScanCursor = 0
   transferThrottleUntil = 0
-  adaptiveTransferSlotLimit = null
-  lastTransferThrottleAt = 0
-  lastTransferSlotIncreaseAt = 0
+  nextRetryingTransferDispatchAt = 0
   hasCheckedLegacyDriveTransfers = false
 
   try {
@@ -930,6 +1128,33 @@ export async function resetDriveTransfers(): Promise<void> {
     await unlink(getLegacyDriveTransfersPath())
   } catch {
     // Transfer state file may not exist on a fresh install.
+  }
+}
+
+export async function resetDriveThumbnailCache(): Promise<void> {
+  const resetError = new Error('썸네일 캐시가 초기화되었습니다.')
+
+  for (const entry of driveThumbnailQueue) {
+    entry.reject(resetError)
+  }
+
+  driveThumbnailCache.clear()
+  driveThumbnailPendingRequests.clear()
+  driveThumbnailWarmPromises.clear()
+  driveThumbnailWarmSignatures.clear()
+  driveThumbnailQueue.splice(0, driveThumbnailQueue.length)
+  driveThumbnailThrottleUntil = 0
+  resetDriveThumbnailAdaptiveRate()
+
+  if (driveThumbnailQueueTimer) {
+    clearTimeout(driveThumbnailQueueTimer)
+    driveThumbnailQueueTimer = null
+  }
+
+  try {
+    await rm(getDriveThumbnailCacheDirectory(), { recursive: true, force: true })
+  } catch {
+    // Thumbnail cache may not exist yet.
   }
 }
 
@@ -1842,12 +2067,19 @@ function queueDownloadTask(
 async function ensureDriveIndexForListing(forceSync: boolean): Promise<DriveIndex> {
   const accountId = await getActiveAccountId()
   let currentIndex = await getCurrentDriveIndex(accountId)
+  const driveSettings = await getDriveSettings()
 
   if (!currentIndex.rootItemId) {
     currentIndex = await ensureRootItemId(currentIndex, accountId)
   }
 
-  if ((forceSync || !isIndexReadyAndFresh(currentIndex)) && !driveIndexSyncPromise) {
+  if (driveSettings.indexMode === 'automatic' && (forceSync || !isIndexReadyAndFresh(currentIndex)) && !isDriveIndexSyncing(accountId)) {
+    emitGraphActivity({
+      level: 'info',
+      scope: 'index',
+      title: '탐색 인덱스 갱신 예약',
+      message: '폴더 목록을 표시하면서 OneDrive 전체 인덱스를 갱신합니다.'
+    })
     startDriveIndexSync(currentIndex, accountId)
   }
 
@@ -1856,14 +2088,16 @@ async function ensureDriveIndexForListing(forceSync: boolean): Promise<DriveInde
 
 function startDriveIndexSync(existingIndex: DriveIndex, accountId: string | null): Promise<DriveIndex> {
   const generation = driveIndexGeneration
+  const syncKey = getDriveIndexSyncKey(accountId)
 
   activeDriveIndexSnapshot = existingIndex
   activeDriveIndexSnapshotAccountId = accountId
-  driveIndexSyncPromise = syncDriveIndex(existingIndex, generation, accountId)
+  const syncPromise = syncDriveIndex(existingIndex, generation, accountId)
     .then((index) => {
       if (generation === driveIndexGeneration) {
         activeDriveIndexSnapshot = index
         activeDriveIndexSnapshotAccountId = accountId
+        startDriveThumbnailCacheWarmup(index, accountId, generation)
       }
 
       return index
@@ -1873,15 +2107,16 @@ function startDriveIndexSync(existingIndex: DriveIndex, accountId: string | null
         console.error('OneDrive index sync failed:', error)
       }
 
-      return activeDriveIndexSnapshot ?? existingIndex
+      return activeDriveIndexSnapshotAccountId === accountId ? activeDriveIndexSnapshot ?? existingIndex : existingIndex
     })
     .finally(() => {
-      if (generation === driveIndexGeneration) {
-        driveIndexSyncPromise = null
+      if (generation === driveIndexGeneration && driveIndexSyncPromises.get(syncKey) === syncPromise) {
+        driveIndexSyncPromises.delete(syncKey)
       }
     })
 
-  return driveIndexSyncPromise
+  driveIndexSyncPromises.set(syncKey, syncPromise)
+  return syncPromise
 }
 
 async function syncDriveIndex(existingIndex: DriveIndex, generation: number, accountId: string | null): Promise<DriveIndex> {
@@ -1899,7 +2134,7 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
 
   const index: DriveIndex =
     existingIndex.rootItemId && existingIndex.rootItemId !== rootItemId
-      ? createEmptyIndex(rootItemId)
+      ? createEmptyDriveIndex(rootItemId)
       : {
           ...existingIndex,
           expandedFolderIds: existingIndex.expandedFolderIds ?? {},
@@ -1909,8 +2144,30 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
   activeDriveIndexSnapshot = index
   activeDriveIndexSnapshotAccountId = accountId
 
-  let url = index.deltaLink ? new URL(index.deltaLink) : createDeltaUrl()
+  const storedDeltaUrl = parseStoredDriveDeltaUrl(index.deltaLink)
+
+  if (index.deltaLink && !storedDeltaUrl) {
+    Object.assign(index, createEmptyDriveIndex(rootItemId))
+    activeDriveIndexSnapshot = index
+    activeDriveIndexSnapshotAccountId = accountId
+  }
+
+  let url = storedDeltaUrl ?? createDeltaUrl()
   let didRestartFromFullEnumeration = false
+  let deltaSequence = 0
+
+  emitGraphActivity({
+    level: 'info',
+    scope: 'index',
+    title: storedDeltaUrl ? '인덱스 변경분 확인 중' : '전체 인덱스 수집 중',
+    message: storedDeltaUrl ? 'OneDrive 변경분(delta)을 가져오는 중입니다.' : 'OneDrive 전체 항목을 페이지 단위로 수집하는 중입니다.',
+    progress: {
+      current: 0,
+      indeterminate: true
+    }
+  })
+
+  await resetDriveDeltaStaging(accountId)
 
   while (true) {
     if (generation !== driveIndexGeneration) {
@@ -1926,29 +2183,75 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
         return index
       }
 
-      for (const item of response.value ?? []) {
-        applyDeltaItem(index, item)
+      const stagePayloads = createDriveDeltaStagePayloads(response.value ?? [], deltaSequence)
+
+      if (stagePayloads.length > 0) {
+        deltaSequence += stagePayloads.length
+        await appendDriveDeltaStaging(accountId, stagePayloads)
+        emitGraphActivity({
+          level: 'info',
+          scope: 'index',
+          title: '인덱스 항목 수집 중',
+          message: `${deltaSequence.toLocaleString('ko-KR')}개 OneDrive 항목 정보를 수집했습니다.`,
+          progress: {
+            current: deltaSequence,
+            indeterminate: true
+          }
+        })
       }
 
       activeDriveIndexSnapshot = index
       activeDriveIndexSnapshotAccountId = accountId
 
       if (response['@odata.nextLink']) {
-        url = parseGraphUrl(response['@odata.nextLink'], 'OneDrive 인덱스 다음 페이지 주소가 올바르지 않습니다.')
+        url = parseDriveDeltaUrl(response['@odata.nextLink'], 'OneDrive 인덱스 다음 페이지 주소가 올바르지 않습니다.')
         continue
       }
 
-      index.deltaLink = response['@odata.deltaLink']
+      emitGraphActivity({
+        level: 'info',
+        scope: 'index',
+        title: '인덱스 적용 중',
+        message: `${deltaSequence.toLocaleString('ko-KR')}개 변경 항목을 로컬 인덱스에 적용합니다.`,
+        progress: {
+          current: deltaSequence,
+          total: Math.max(deltaSequence, 1)
+        }
+      })
+      await applyStagedDriveDelta(index, accountId)
+      await clearDriveDeltaStaging(accountId)
+      index.deltaLink = normalizeDriveDeltaLink(response['@odata.deltaLink'])
       index.syncedAt = new Date().toISOString()
       await writeDriveIndex(index, accountId)
+      emitGraphActivity({
+        level: 'success',
+        scope: 'index',
+        title: '탐색 인덱스 갱신 완료',
+        message: `${Object.keys(index.items).length.toLocaleString('ko-KR')}개 항목을 인덱싱했습니다.`,
+        progress: {
+          current: 1,
+          total: 1
+        }
+      })
       return index
     } catch (error) {
       if (error instanceof GraphResponseError && error.status === 410 && !didRestartFromFullEnumeration) {
         didRestartFromFullEnumeration = true
-        Object.assign(index, createEmptyIndex(rootItemId))
+        emitGraphActivity({
+          level: 'warning',
+          scope: 'index',
+          title: '인덱스 전체 재수집',
+          message: 'OneDrive delta 토큰이 만료되어 전체 인덱스를 다시 수집합니다.',
+          detail: error.message,
+          status: error.status,
+          retryAfterMs: error.retryAfterMs
+        })
+        Object.assign(index, createEmptyDriveIndex(rootItemId))
         activeDriveIndexSnapshot = index
         activeDriveIndexSnapshotAccountId = accountId
-        url = error.location ? parseGraphUrl(error.location, 'OneDrive 인덱스 재동기화 주소가 올바르지 않습니다.') : createDeltaUrl()
+        deltaSequence = 0
+        await resetDriveDeltaStaging(accountId)
+        url = parseStoredDriveDeltaUrl(error.location) ?? createDeltaUrl()
         continue
       }
 
@@ -2022,11 +2325,16 @@ async function ensureRemoteDriveFolder(
 ): Promise<CloudDriveItem> {
   const normalizedFolderName = validateDriveItemName(folderName)
   const currentIndex = await fetchAndMergeFolderChildren(index, parentId)
-  const existingFolder = Object.values(currentIndex.items).find(
-    (item) => item.parentId === parentId && item.type === 'folder' && item.name.localeCompare(normalizedFolderName, 'ko-KR', { sensitivity: 'base' }) === 0
-  )
+  const existingFolder =
+    (await findDriveIndexChildByName(await getActiveAccountId(), parentId, normalizedFolderName)) ??
+    Object.values(currentIndex.items).find(
+      (item) =>
+        item.parentId === parentId &&
+        item.type === 'folder' &&
+        item.name.localeCompare(normalizedFolderName, 'ko-KR', { sensitivity: 'base' }) === 0
+    )
 
-  if (existingFolder) {
+  if (existingFolder?.type === 'folder') {
     return existingFolder
   }
 
@@ -2937,6 +3245,35 @@ async function mergeRemoteDriveItem(item: GraphDriveItem, fallbackParentId?: str
   return nextItem
 }
 
+function createDriveDeltaStagePayloads(items: GraphDriveItem[], startSequence: number): DriveDeltaStagePayload[] {
+  const payloads: DriveDeltaStagePayload[] = []
+  let sequence = startSequence
+
+  for (const item of items) {
+    if (!item.id) {
+      continue
+    }
+
+    payloads.push({
+      itemId: item.id,
+      sequence,
+      payload: JSON.stringify(item),
+      isTombstone: Boolean(item.deleted)
+    })
+    sequence += 1
+  }
+
+  return payloads
+}
+
+async function applyStagedDriveDelta(index: DriveIndex, accountId: string | null): Promise<void> {
+  const stagePayloads = await readLastOccurrenceDriveDeltaStaging(accountId)
+
+  for (const stagePayload of stagePayloads) {
+    applyDeltaItem(index, JSON.parse(stagePayload.payload) as GraphDriveItem)
+  }
+}
+
 function applyDeltaItem(index: DriveIndex, item: GraphDriveItem): void {
   if (!item.id || item.id === index.rootItemId) {
     return
@@ -2997,7 +3334,10 @@ function mapDriveItem(item: GraphDriveItem, previousItem?: CloudDriveItem): Clou
     webUrl: item.webUrl ?? previousItem?.webUrl,
     parentId: item.parentReference?.id ?? previousItem?.parentId,
     childCount: item.folder?.childCount ?? previousItem?.childCount,
-    mimeType: item.file?.mimeType ?? previousItem?.mimeType
+    mimeType: item.file?.mimeType ?? previousItem?.mimeType,
+    quickXorHash: normalizeContentHash(item.file?.hashes?.quickXorHash) ?? previousItem?.quickXorHash,
+    cTag: normalizeContentHash(item.cTag) ?? previousItem?.cTag,
+    eTag: normalizeContentHash(item.eTag) ?? previousItem?.eTag
   }
 }
 
@@ -3045,19 +3385,864 @@ function isFolderLocallyNavigable(index: DriveIndex, parentId: string): boolean 
   return isIndexUsable(index) || Boolean(index.expandedFolderIds[parentId])
 }
 
-function createDriveIndexStatus(index: DriveIndex): DriveIndexStatus {
+function createDriveIndexStatus(index: DriveIndex, accountId: string | null): DriveIndexStatus {
   const items = Object.values(index.items)
 
   return {
     isReady: isIndexUsable(index),
     isFresh: isIndexReadyAndFresh(index),
-    isSyncing: Boolean(driveIndexSyncPromise),
+    isSyncing: isDriveIndexSyncing(accountId),
     itemCount: items.length,
     folderCount: items.filter((item) => item.type === 'folder').length,
     fileCount: items.filter((item) => item.type === 'file').length,
     packageCount: items.filter((item) => item.type === 'package').length,
     syncedAt: index.syncedAt
   }
+}
+
+function isDriveIndexSyncing(accountId: string | null): boolean {
+  return driveIndexSyncPromises.has(getDriveIndexSyncKey(accountId))
+}
+
+function getDriveIndexSyncKey(accountId: string | null): string {
+  return accountId ?? '__active__'
+}
+
+async function normalizeDriveThumbnailRequest(request: DriveThumbnailRequest): Promise<InternalDriveThumbnailRequest> {
+  const itemId = request.itemId?.trim()
+
+  if (!itemId) {
+    throw new Error('썸네일을 가져올 OneDrive 항목을 확인하지 못했습니다.')
+  }
+
+  return {
+    accountId: request.accountId ?? (await getActiveAccountId()),
+    itemId,
+    cacheKey: request.cacheKey?.trim() || 'current',
+    priority: request.priority === 'high' ? 'high' : 'normal',
+    size: normalizeDriveThumbnailSize(request.size),
+    cacheOnly: request.cacheOnly === true
+  }
+}
+
+function normalizeDriveThumbnailSize(size: DriveThumbnailSize | undefined): DriveThumbnailSize {
+  if (!size) {
+    return DRIVE_THUMBNAIL_DEFAULT_SIZE
+  }
+
+  if (size === 'small' || size === 'medium' || size === 'large' || /^c\d+x\d+(?:_crop)?$/.test(size)) {
+    return size
+  }
+
+  return DRIVE_THUMBNAIL_DEFAULT_SIZE
+}
+
+function createDriveThumbnailCacheKey(request: InternalDriveThumbnailRequest): string {
+  return [request.accountId ?? 'active', request.itemId, request.size, request.cacheKey].join('\u001f')
+}
+
+function createDriveThumbnailPendingKey(request: InternalDriveThumbnailRequest, cacheKey: string): string {
+  return `${cacheKey}\u001f${request.cacheOnly ? 'cache' : 'result'}`
+}
+
+function enqueueDriveThumbnailRequest(request: InternalDriveThumbnailRequest, cacheKey: string): Promise<DriveThumbnailResult> {
+  const requestPromise = new Promise<DriveThumbnailResult>((resolve, reject) => {
+    const entry: DriveThumbnailQueueEntry = {
+      request,
+      cacheKey,
+      attemptCount: 0,
+      resolve,
+      reject
+    }
+
+    if (request.priority === 'high') {
+      driveThumbnailQueue.unshift(entry)
+    } else {
+      driveThumbnailQueue.push(entry)
+    }
+  })
+
+  scheduleDriveThumbnailQueueFlush()
+  return requestPromise
+}
+
+function scheduleDriveThumbnailQueueFlush(delayMs = DRIVE_THUMBNAIL_BATCH_DELAY_MS): void {
+  if (driveThumbnailQueueTimer) {
+    return
+  }
+
+  const normalizedDelayMs = Math.max(DRIVE_THUMBNAIL_BATCH_DELAY_MS, delayMs, getDriveThumbnailThrottleDelayMs())
+
+  driveThumbnailQueueTimer = setTimeout(() => {
+    driveThumbnailQueueTimer = null
+    void flushDriveThumbnailQueue()
+  }, normalizedDelayMs)
+}
+
+async function flushDriveThumbnailQueue(): Promise<void> {
+  if (driveThumbnailQueueFlushPromise) {
+    return driveThumbnailQueueFlushPromise
+  }
+
+  driveThumbnailQueueFlushPromise = flushDriveThumbnailQueueOnce().finally(() => {
+    driveThumbnailQueueFlushPromise = null
+
+    if (driveThumbnailQueue.length > 0) {
+      scheduleDriveThumbnailQueueFlush()
+    }
+  })
+
+  return driveThumbnailQueueFlushPromise
+}
+
+async function flushDriveThumbnailQueueOnce(): Promise<void> {
+  while (driveThumbnailQueue.length > 0) {
+    const throttleDelayMs = getDriveThumbnailThrottleDelayMs()
+
+    if (throttleDelayMs > 0) {
+      scheduleDriveThumbnailQueueFlush(throttleDelayMs)
+      return
+    }
+
+    await fetchDriveThumbnailQueueBatch(takeDriveThumbnailQueueBatch())
+
+    const nextThrottleDelayMs = getDriveThumbnailThrottleDelayMs()
+
+    if (nextThrottleDelayMs > 0) {
+      scheduleDriveThumbnailQueueFlush(nextThrottleDelayMs)
+      return
+    }
+
+    if (driveThumbnailQueue.length > 0) {
+      await delay(driveThumbnailBatchStepDelayMs)
+    }
+  }
+}
+
+function takeDriveThumbnailQueueBatch(): DriveThumbnailQueueEntry[] {
+  const firstEntry = driveThumbnailQueue.shift()
+
+  if (!firstEntry) {
+    return []
+  }
+
+  const groupKey = getDriveThumbnailQueueGroupKey(firstEntry)
+  const batchEntries = [firstEntry]
+
+  for (let index = 0; index < driveThumbnailQueue.length && batchEntries.length < driveThumbnailBatchLimit; ) {
+    const entry = driveThumbnailQueue[index]
+
+    if (canJoinDriveThumbnailQueueBatch(firstEntry, entry, groupKey)) {
+      batchEntries.push(entry)
+      driveThumbnailQueue.splice(index, 1)
+      continue
+    }
+
+    index += 1
+  }
+
+  return batchEntries
+}
+
+function getDriveThumbnailQueueGroupKey(entry: DriveThumbnailQueueEntry): string {
+  return `${entry.request.accountId ?? 'active'}\u001f${entry.request.size}`
+}
+
+function canJoinDriveThumbnailQueueBatch(
+  firstEntry: DriveThumbnailQueueEntry,
+  entry: DriveThumbnailQueueEntry,
+  groupKey = getDriveThumbnailQueueGroupKey(firstEntry)
+): boolean {
+  if (getDriveThumbnailQueueGroupKey(entry) !== groupKey) {
+    return false
+  }
+
+  if (firstEntry.request.priority === 'high' && entry.request.priority !== 'high') {
+    return false
+  }
+
+  return true
+}
+
+async function fetchDriveThumbnailQueueBatch(entries: DriveThumbnailQueueEntry[]): Promise<void> {
+  if (entries.length === 0) {
+    return
+  }
+
+  try {
+    const outcomes = await fetchDriveThumbnailBatch(entries.map((entry) => entry.request))
+    const successfulEntries = entries
+      .map((entry, index) => ({
+        entry,
+        outcome: outcomes[index]
+      }))
+      .filter(
+        (value): value is { entry: DriveThumbnailQueueEntry; outcome: Extract<DriveThumbnailBatchOutcome, { status: 'fulfilled' }> } =>
+          value.outcome?.status === 'fulfilled'
+      )
+    const failedEntries = entries
+      .map((entry, index) => ({
+        entry,
+        outcome: outcomes[index]
+      }))
+      .filter(
+        (value): value is { entry: DriveThumbnailQueueEntry; outcome: Extract<DriveThumbnailBatchOutcome, { status: 'rejected' }> } =>
+          value.outcome?.status === 'rejected'
+      )
+
+    const materializedResults = await Promise.all(
+      successfulEntries.map(async ({ entry, outcome }) => ({
+        entry,
+        result: await materializeDriveThumbnailResult(entry.cacheKey, outcome.result, {
+          cacheOnly: entry.request.cacheOnly
+        })
+      }))
+    )
+
+    for (const { entry, result } of materializedResults) {
+      if (!entry.request.cacheOnly) {
+        cacheDriveThumbnailResult(entry.cacheKey, result)
+      }
+
+      entry.resolve(result)
+    }
+
+    if (successfulEntries.length > 0) {
+      recordDriveThumbnailBatchSuccess(successfulEntries.length)
+    }
+
+    if (failedEntries.length > 0) {
+      handleDriveThumbnailQueueBatchError(
+        failedEntries.map(({ entry }) => entry),
+        selectDriveThumbnailBatchError(failedEntries.map(({ outcome }) => outcome.reason))
+      )
+    }
+  } catch (error) {
+    handleDriveThumbnailQueueBatchError(entries, error)
+  }
+}
+
+function handleDriveThumbnailQueueBatchError(entries: DriveThumbnailQueueEntry[], error: unknown): void {
+  const retryableEntries = entries.filter((entry) => entry.attemptCount < DRIVE_THUMBNAIL_MAX_RETRIES)
+  const retryDelayMs = getDriveThumbnailRetryDelayMs(retryableEntries, error)
+
+  if (retryDelayMs !== undefined) {
+    recordDriveThumbnailBatchThrottle()
+    emitGraphActivity({
+      level: 'warning',
+      scope: 'thumbnail',
+      title: '썸네일 요청 제한',
+      message: `${entries.length.toLocaleString('ko-KR')}개 썸네일 요청이 제한되어 ${formatRetryDelay(retryDelayMs)} 후 재시도합니다.`,
+      detail: getErrorMessage(error, 'OneDrive 썸네일 요청이 제한되었습니다.'),
+      status: error instanceof GraphResponseError ? error.status : undefined,
+      retryAfterMs: error instanceof GraphResponseError ? error.retryAfterMs : undefined
+    })
+    retryDriveThumbnailQueueEntries(retryableEntries, retryDelayMs)
+
+    for (const entry of entries) {
+      if (!retryableEntries.includes(entry)) {
+        entry.reject(error)
+      }
+    }
+
+    return
+  }
+
+  if (isDriveThumbnailRetryableError(error)) {
+    recordDriveThumbnailBatchThrottle()
+    throttleDriveThumbnails(getRetryAfterDelayMs(error) ?? DRIVE_THUMBNAIL_RETRY_BASE_DELAY_MS)
+    emitGraphActivity({
+      level: 'warning',
+      scope: 'thumbnail',
+      title: '썸네일 요청 보류',
+      message: '썸네일 요청 제한이 반복되어 일부 항목은 기본 아이콘으로 표시합니다.',
+      detail: getErrorMessage(error, 'OneDrive 썸네일 요청이 제한되었습니다.'),
+      status: error instanceof GraphResponseError ? error.status : undefined,
+      retryAfterMs: error instanceof GraphResponseError ? error.retryAfterMs : undefined
+    })
+
+    for (const entry of entries) {
+      const result = createMissingDriveThumbnailResult(entry.request.itemId)
+
+      if (!entry.request.cacheOnly) {
+        cacheDriveThumbnailResult(entry.cacheKey, result)
+      }
+
+      entry.resolve(result)
+    }
+
+    return
+  }
+
+  for (const entry of entries) {
+    entry.reject(error)
+  }
+}
+
+function selectDriveThumbnailBatchError(errors: unknown[]): unknown {
+  return (
+    errors
+      .filter((error): error is GraphResponseError => error instanceof GraphResponseError && error.retryAfterMs !== undefined)
+      .sort((left, right) => (right.retryAfterMs ?? 0) - (left.retryAfterMs ?? 0))[0] ??
+    errors.find((error) => error instanceof GraphResponseError) ??
+    errors[0] ??
+    new Error('OneDrive 썸네일 요청에 실패했습니다.')
+  )
+}
+
+async function fetchDriveThumbnailBatch(requests: InternalDriveThumbnailRequest[]): Promise<DriveThumbnailBatchOutcome[]> {
+  if (requests.length === 1) {
+    const [request] = requests
+
+    try {
+      return [
+        {
+          status: 'fulfilled',
+          result: await fetchDriveThumbnail(request)
+        }
+      ]
+    } catch (error) {
+      return [
+        {
+          status: 'rejected',
+          reason: error
+        }
+      ]
+    }
+  }
+
+  const [firstRequest] = requests
+  const accessToken = await getGraphAccessToken(firstRequest.accountId)
+  const response = await graphSend<GraphBatchThumbnailResponse>(createGraphBatchUrl(), accessToken, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      requests: requests.map((request, index) => ({
+        id: String(index),
+        method: 'GET',
+        url: createThumbnailBatchRequestUrl(request.itemId, request.size)
+      }))
+    })
+  })
+  const itemResponses = new Map(response.responses?.map((itemResponse) => [itemResponse.id, itemResponse]) ?? [])
+
+  return requests.map((request, index) => {
+    const itemResponse = itemResponses.get(String(index))
+
+    try {
+      return {
+        status: 'fulfilled',
+        result: readDriveThumbnailBatchItemResult(request, itemResponse)
+      }
+    } catch (error) {
+      return {
+        status: 'rejected',
+        reason: error
+      }
+    }
+  })
+}
+
+async function fetchDriveThumbnail(request: InternalDriveThumbnailRequest): Promise<DriveThumbnailResult> {
+  const accessToken = await getGraphAccessToken(request.accountId)
+
+  try {
+    const response = await graphGet<GraphThumbnailResponse>(createThumbnailUrl(request.itemId, request.size), accessToken)
+
+    return readDriveThumbnailResult(request, response)
+  } catch (error) {
+    if (error instanceof GraphResponseError && (error.status === 400 || error.status === 404)) {
+      return createMissingDriveThumbnailResult(request.itemId)
+    }
+
+    throw error
+  }
+}
+
+function readDriveThumbnailBatchItemResult(
+  request: InternalDriveThumbnailRequest,
+  itemResponse: GraphBatchThumbnailItemResponse | undefined
+): DriveThumbnailResult {
+  if (!itemResponse || typeof itemResponse.status !== 'number') {
+    return createMissingDriveThumbnailResult(request.itemId)
+  }
+
+  if (itemResponse.status === 400 || itemResponse.status === 404) {
+    return createMissingDriveThumbnailResult(request.itemId)
+  }
+
+  if (itemResponse.status < 200 || itemResponse.status >= 300) {
+    throw new GraphResponseError(
+      formatDriveThumbnailBatchError(itemResponse),
+      itemResponse.status,
+      null,
+      parseRetryAfterMsFromRecord(itemResponse.headers)
+    )
+  }
+
+  return readDriveThumbnailResult(request, itemResponse.body as GraphThumbnailResponse)
+}
+
+function readDriveThumbnailResult(request: InternalDriveThumbnailRequest, response: GraphThumbnailResponse | undefined): DriveThumbnailResult {
+  const thumbnailSet = response?.value?.[0]
+  const thumbnail =
+    getGraphThumbnail(thumbnailSet, request.size) ??
+    getGraphThumbnail(thumbnailSet, 'medium') ??
+    getGraphThumbnail(thumbnailSet, 'small') ??
+    getGraphThumbnail(thumbnailSet, 'large')
+
+  if (!thumbnail?.url) {
+    return createMissingDriveThumbnailResult(request.itemId)
+  }
+
+  return {
+    itemId: request.itemId,
+    status: 'ready',
+    url: thumbnail.url,
+    width: thumbnail.width,
+    height: thumbnail.height
+  }
+}
+
+function getGraphThumbnail(thumbnailSet: GraphThumbnailSet | undefined, size: DriveThumbnailSize | 'medium' | 'small' | 'large'): GraphThumbnail | null {
+  const value = thumbnailSet?.[size]
+
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const thumbnail = value as GraphThumbnail
+
+  return typeof thumbnail.url === 'string' && thumbnail.url.length > 0 ? thumbnail : null
+}
+
+function createMissingDriveThumbnailResult(itemId: string): DriveThumbnailResult {
+  return {
+    itemId,
+    status: 'missing'
+  }
+}
+
+function cacheDriveThumbnailResult(cacheKey: string, result: DriveThumbnailResult): void {
+  driveThumbnailCache.set(cacheKey, {
+    result,
+    expiresAtMs: Date.now() + (result.status === 'ready' ? DRIVE_THUMBNAIL_URL_CACHE_MS : DRIVE_THUMBNAIL_MISSING_CACHE_MS)
+  })
+}
+
+function startDriveThumbnailCacheWarmup(index: DriveIndex, accountId: string | null, generation = driveIndexGeneration): void {
+  const warmKey = getDriveIndexSyncKey(accountId)
+  const warmSignature = createDriveThumbnailWarmSignature(index)
+
+  if (driveThumbnailWarmSignatures.get(warmKey) === warmSignature || driveThumbnailWarmPromises.has(warmKey)) {
+    return
+  }
+
+  const candidates = collectDriveThumbnailWarmCandidates(index)
+
+  if (candidates.length === 0) {
+    driveThumbnailWarmSignatures.set(warmKey, warmSignature)
+    return
+  }
+
+  emitGraphActivity({
+    level: 'info',
+    scope: 'thumbnail',
+    title: '썸네일 캐시 준비 시작',
+    message: `${candidates.length.toLocaleString('ko-KR')}개 이미지/동영상 썸네일을 백그라운드로 준비합니다.`,
+    progress: {
+      current: 0,
+      total: candidates.length
+    }
+  })
+
+  const warmPromise = warmDriveThumbnailCache(candidates, accountId, generation)
+    .then(() => {
+      if (generation === driveIndexGeneration) {
+        driveThumbnailWarmSignatures.set(warmKey, warmSignature)
+        emitGraphActivity({
+          level: 'success',
+          scope: 'thumbnail',
+          title: '썸네일 캐시 준비 완료',
+          message: `${candidates.length.toLocaleString('ko-KR')}개 후보 썸네일 처리를 마쳤습니다.`,
+          progress: {
+            current: candidates.length,
+            total: candidates.length
+          }
+        })
+      }
+    })
+    .catch((error) => {
+      if (generation === driveIndexGeneration) {
+        console.error('OneDrive thumbnail cache warmup failed:', error)
+      }
+    })
+    .finally(() => {
+      if (driveThumbnailWarmPromises.get(warmKey) === warmPromise) {
+        driveThumbnailWarmPromises.delete(warmKey)
+      }
+    })
+
+  driveThumbnailWarmPromises.set(warmKey, warmPromise)
+}
+
+async function warmDriveThumbnailCache(items: CloudDriveItem[], accountId: string | null, generation: number): Promise<void> {
+  for (let index = 0; index < items.length; index += DRIVE_THUMBNAIL_WARM_BATCH_SIZE) {
+    if (generation !== driveIndexGeneration) {
+      return
+    }
+
+    const batchItems = items.slice(index, index + DRIVE_THUMBNAIL_WARM_BATCH_SIZE)
+
+    await Promise.allSettled(
+      batchItems.map((item) =>
+        getDriveItemThumbnail({
+          accountId,
+          itemId: item.id,
+          cacheKey: createDriveThumbnailItemCacheKey(item),
+          priority: 'normal',
+          size: DRIVE_THUMBNAIL_DEFAULT_SIZE,
+          cacheOnly: true
+        })
+      )
+    )
+
+    emitGraphActivity({
+      level: 'info',
+      scope: 'thumbnail',
+      title: '썸네일 캐시 준비 중',
+      message: `${Math.min(index + batchItems.length, items.length).toLocaleString('ko-KR')} / ${items.length.toLocaleString(
+        'ko-KR'
+      )}개 후보를 처리했습니다.`,
+      progress: {
+        current: Math.min(index + batchItems.length, items.length),
+        total: items.length
+      }
+    })
+
+    if (index + DRIVE_THUMBNAIL_WARM_BATCH_SIZE < items.length) {
+      await delay(DRIVE_THUMBNAIL_WARM_BATCH_DELAY_MS)
+    }
+  }
+}
+
+function collectDriveThumbnailWarmCandidates(index: DriveIndex): CloudDriveItem[] {
+  return Object.values(index.items).filter(isDriveThumbnailWarmCandidate)
+}
+
+function isDriveThumbnailWarmCandidate(item: CloudDriveItem): boolean {
+  if (item.type !== 'file') {
+    return false
+  }
+
+  const mimeType = item.mimeType?.toLocaleLowerCase('en-US') ?? ''
+
+  if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
+    return true
+  }
+
+  const extension = getDriveItemFileExtension(item.name)
+
+  return DRIVE_THUMBNAIL_IMAGE_EXTENSIONS.has(extension) || DRIVE_THUMBNAIL_VIDEO_EXTENSIONS.has(extension)
+}
+
+function createDriveThumbnailItemCacheKey(item: CloudDriveItem): string {
+  return item.cTag ?? item.eTag ?? `${item.size}:${item.lastModifiedDateTime ?? ''}`
+}
+
+function createDriveThumbnailWarmSignature(index: DriveIndex): string {
+  return `${index.syncedAt ?? ''}:${Object.keys(index.items).length}`
+}
+
+function getDriveItemFileExtension(name: string): string {
+  const extension = extname(name).toLocaleLowerCase('en-US')
+
+  return extension.startsWith('.') ? extension.slice(1) : extension
+}
+
+async function readCachedDriveThumbnailResult(cacheKey: string, itemId: string): Promise<DriveThumbnailResult | null> {
+  try {
+    const { dataPath, metadataPath } = getDriveThumbnailCachePaths(cacheKey)
+    const metadata = normalizeDriveThumbnailDiskCacheEntry(JSON.parse(await readFile(metadataPath, 'utf8')), itemId)
+
+    if (!metadata) {
+      return null
+    }
+
+    if (metadata.expiresAtMs <= Date.now()) {
+      await removeDriveThumbnailDiskCache(cacheKey)
+      return null
+    }
+
+    const bytes = await readFile(dataPath)
+
+    if (bytes.byteLength <= 0 || bytes.byteLength > DRIVE_THUMBNAIL_MAX_CACHE_BYTES) {
+      return null
+    }
+
+    return {
+      itemId: metadata.itemId,
+      status: 'ready',
+      url: createDriveThumbnailDataUrl(metadata.contentType, bytes),
+      width: metadata.width,
+      height: metadata.height
+    }
+  } catch {
+    return null
+  }
+}
+
+async function hasFreshDriveThumbnailDiskCache(cacheKey: string, itemId: string): Promise<boolean> {
+  try {
+    const { dataPath, metadataPath } = getDriveThumbnailCachePaths(cacheKey)
+    const metadata = normalizeDriveThumbnailDiskCacheEntry(JSON.parse(await readFile(metadataPath, 'utf8')), itemId)
+
+    if (!metadata) {
+      return false
+    }
+
+    if (metadata.expiresAtMs <= Date.now()) {
+      await removeDriveThumbnailDiskCache(cacheKey)
+      return false
+    }
+
+    const dataStats = await stat(dataPath)
+
+    return dataStats.isFile() && dataStats.size > 0 && dataStats.size <= DRIVE_THUMBNAIL_MAX_CACHE_BYTES
+  } catch {
+    return false
+  }
+}
+
+async function materializeDriveThumbnailResult(
+  cacheKey: string,
+  result: DriveThumbnailResult,
+  options: { cacheOnly?: boolean } = {}
+): Promise<DriveThumbnailResult> {
+  if (result.status !== 'ready' || !result.url || result.url.startsWith('data:')) {
+    return result
+  }
+
+  try {
+    const response = await fetch(result.url)
+
+    if (!response.ok) {
+      return result
+    }
+
+    const contentType = normalizeDriveThumbnailContentType(response.headers.get('content-type'))
+    const arrayBuffer = await response.arrayBuffer()
+
+    if (arrayBuffer.byteLength <= 0 || arrayBuffer.byteLength > DRIVE_THUMBNAIL_MAX_CACHE_BYTES) {
+      return result
+    }
+
+    const bytes = Buffer.from(arrayBuffer)
+    const cachedResult: DriveThumbnailResult = options.cacheOnly
+      ? {
+          itemId: result.itemId,
+          status: 'ready',
+          width: result.width,
+          height: result.height
+        }
+      : {
+          ...result,
+          url: createDriveThumbnailDataUrl(contentType, bytes)
+        }
+
+    try {
+      await writeDriveThumbnailDiskCache(cacheKey, cachedResult, contentType, bytes)
+    } catch {
+      // A disk cache miss should not prevent the thumbnail from rendering.
+    }
+
+    return cachedResult
+  } catch {
+    return result
+  }
+}
+
+async function writeDriveThumbnailDiskCache(
+  cacheKey: string,
+  result: DriveThumbnailResult,
+  contentType: string,
+  bytes: Buffer
+): Promise<void> {
+  const { dataPath, metadataPath } = getDriveThumbnailCachePaths(cacheKey)
+  const temporaryDataPath = `${dataPath}.${process.pid}.${randomUUID()}.tmp`
+  const now = Date.now()
+  const metadata: DriveThumbnailDiskCacheEntry = {
+    version: 1,
+    itemId: result.itemId,
+    contentType,
+    width: result.width,
+    height: result.height,
+    createdAtMs: now,
+    expiresAtMs: now + DRIVE_THUMBNAIL_DISK_CACHE_MS
+  }
+
+  await mkdir(dirname(dataPath), { recursive: true })
+  await writeFile(temporaryDataPath, bytes)
+  await rename(temporaryDataPath, dataPath)
+  await writeJsonAtomic(metadataPath, metadata)
+}
+
+async function removeDriveThumbnailDiskCache(cacheKey: string): Promise<void> {
+  const { dataPath, metadataPath } = getDriveThumbnailCachePaths(cacheKey)
+
+  await Promise.all([unlinkIfExists(dataPath), unlinkIfExists(metadataPath)])
+}
+
+function normalizeDriveThumbnailDiskCacheEntry(value: unknown, itemId: string): DriveThumbnailDiskCacheEntry | null {
+  const metadata = value as Partial<DriveThumbnailDiskCacheEntry>
+
+  if (
+    metadata.version !== 1 ||
+    metadata.itemId !== itemId ||
+    typeof metadata.contentType !== 'string' ||
+    typeof metadata.createdAtMs !== 'number' ||
+    !Number.isFinite(metadata.createdAtMs) ||
+    typeof metadata.expiresAtMs !== 'number' ||
+    !Number.isFinite(metadata.expiresAtMs)
+  ) {
+    return null
+  }
+
+  return {
+    version: 1,
+    itemId: metadata.itemId,
+    contentType: normalizeDriveThumbnailContentType(metadata.contentType),
+    width: typeof metadata.width === 'number' && Number.isFinite(metadata.width) ? metadata.width : undefined,
+    height: typeof metadata.height === 'number' && Number.isFinite(metadata.height) ? metadata.height : undefined,
+    createdAtMs: metadata.createdAtMs,
+    expiresAtMs: metadata.expiresAtMs
+  }
+}
+
+function createDriveThumbnailDataUrl(contentType: string, bytes: Buffer): string {
+  return `data:${normalizeDriveThumbnailContentType(contentType)};base64,${bytes.toString('base64')}`
+}
+
+function normalizeDriveThumbnailContentType(contentType: string | null): string {
+  const normalizedContentType = contentType?.split(';', 1)[0]?.trim().toLocaleLowerCase('en-US')
+
+  return normalizedContentType?.startsWith('image/') ? normalizedContentType : DRIVE_THUMBNAIL_DEFAULT_CONTENT_TYPE
+}
+
+function getDriveThumbnailRetryDelayMs(entries: DriveThumbnailQueueEntry[], error: unknown): number | undefined {
+  if (entries.length === 0 || !isDriveThumbnailRetryableError(error)) {
+    return undefined
+  }
+
+  const nextAttemptCount = Math.max(...entries.map((entry) => entry.attemptCount + 1))
+  const exponentialDelayMs = DRIVE_THUMBNAIL_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, nextAttemptCount - 1)
+  const cappedDelayMs = Math.min(exponentialDelayMs, DRIVE_THUMBNAIL_RETRY_MAX_DELAY_MS)
+  const jitterMs = Math.floor(Math.random() * Math.min(5000, cappedDelayMs / 3))
+
+  return Math.max(cappedDelayMs + jitterMs, getRetryAfterDelayMs(error) ?? 0)
+}
+
+function retryDriveThumbnailQueueEntries(entries: DriveThumbnailQueueEntry[], delayMs: number): void {
+  for (const entry of entries) {
+    entry.attemptCount += 1
+  }
+
+  requeueDriveThumbnailEntries(entries)
+  throttleDriveThumbnails(delayMs)
+  scheduleDriveThumbnailQueueFlush(delayMs)
+}
+
+function requeueDriveThumbnailEntries(entries: DriveThumbnailQueueEntry[]): void {
+  if (entries.length === 0) {
+    return
+  }
+
+  const firstNormalPriorityIndex = driveThumbnailQueue.findIndex((entry) => entry.request.priority !== 'high')
+
+  if (firstNormalPriorityIndex < 0) {
+    driveThumbnailQueue.push(...entries)
+  } else {
+    driveThumbnailQueue.splice(firstNormalPriorityIndex, 0, ...entries)
+  }
+}
+
+function recordDriveThumbnailBatchSuccess(successfulItemCount: number): void {
+  driveThumbnailSuccessfulItemCount += successfulItemCount
+
+  if (driveThumbnailSuccessfulItemCount < DRIVE_THUMBNAIL_ADAPTIVE_SUCCESS_TARGET) {
+    return
+  }
+
+  driveThumbnailSuccessfulItemCount = 0
+  driveThumbnailBatchLimit = Math.min(DRIVE_THUMBNAIL_BATCH_LIMIT_MAX, driveThumbnailBatchLimit + 1)
+  driveThumbnailBatchStepDelayMs = Math.max(
+    DRIVE_THUMBNAIL_BATCH_STEP_DELAY_MIN_MS,
+    Math.floor(driveThumbnailBatchStepDelayMs * 0.8)
+  )
+}
+
+function recordDriveThumbnailBatchThrottle(): void {
+  driveThumbnailSuccessfulItemCount = 0
+  driveThumbnailBatchLimit = Math.max(DRIVE_THUMBNAIL_BATCH_LIMIT_MIN, Math.floor(driveThumbnailBatchLimit / 2))
+  driveThumbnailBatchStepDelayMs = Math.min(
+    DRIVE_THUMBNAIL_BATCH_STEP_DELAY_MAX_MS,
+    Math.max(DRIVE_THUMBNAIL_BATCH_STEP_DELAY_INITIAL_MS, driveThumbnailBatchStepDelayMs * 2)
+  )
+}
+
+function resetDriveThumbnailAdaptiveRate(): void {
+  driveThumbnailBatchLimit = DRIVE_THUMBNAIL_BATCH_LIMIT_INITIAL
+  driveThumbnailBatchStepDelayMs = DRIVE_THUMBNAIL_BATCH_STEP_DELAY_INITIAL_MS
+  driveThumbnailSuccessfulItemCount = 0
+}
+
+function throttleDriveThumbnails(delayMs: number): void {
+  const now = Date.now()
+
+  driveThumbnailThrottleUntil = Math.max(driveThumbnailThrottleUntil, now + Math.max(delayMs, DRIVE_THUMBNAIL_BATCH_DELAY_MS))
+}
+
+function getDriveThumbnailThrottleDelayMs(): number {
+  return Math.max(0, driveThumbnailThrottleUntil - Date.now())
+}
+
+function isDriveThumbnailRetryableError(error: unknown): boolean {
+  return (
+    error instanceof GraphResponseError &&
+    (error.status === 429 || error.retryAfterMs !== undefined || (error.status >= 500 && error.status < 600))
+  )
+}
+
+function formatDriveThumbnailBatchError(response: GraphBatchThumbnailItemResponse): string {
+  const body = response.body
+
+  if (body && typeof body === 'object') {
+    const errorBody = body as GraphErrorResponse
+
+    if (typeof errorBody.error?.message === 'string' && errorBody.error.message.length > 0) {
+      return errorBody.error.message
+    }
+  }
+
+  return response.status === 429 ? 'OneDrive 썸네일 요청이 일시적으로 제한되었습니다.' : 'OneDrive 썸네일을 가져오지 못했습니다.'
+}
+
+function parseRetryAfterMsFromRecord(headers: Record<string, string> | undefined): number | undefined {
+  if (!headers) {
+    return undefined
+  }
+
+  const retryAfterMs = parsePositiveDelayMs(headers['x-ms-retry-after-ms'] ?? headers['X-Ms-Retry-After-Ms'] ?? null)
+
+  if (retryAfterMs !== undefined) {
+    return retryAfterMs
+  }
+
+  const retryAfter = headers['Retry-After'] ?? headers['retry-after']
+
+  return parseRetryAfterMsFromValue(retryAfter ?? null)
 }
 
 function createRootUrl(): URL {
@@ -3081,6 +4266,10 @@ function createDriveUsageUrl(): URL {
   return url
 }
 
+function createGraphBatchUrl(): URL {
+  return new URL(`${GRAPH_BASE_URL}/$batch`)
+}
+
 function createItemUrl(itemId: string, withSelect = false): URL {
   const url = new URL(`${GRAPH_BASE_URL}/me/drive/items/${encodeURIComponent(itemId)}`)
 
@@ -3093,6 +4282,20 @@ function createItemUrl(itemId: string, withSelect = false): URL {
 
 function createDownloadContentUrl(itemId: string): URL {
   return new URL(`${GRAPH_BASE_URL}/me/drive/items/${encodeURIComponent(itemId)}/content`)
+}
+
+function createThumbnailUrl(itemId: string, size: DriveThumbnailSize): URL {
+  const url = new URL(`${GRAPH_BASE_URL}/me/drive/items/${encodeURIComponent(itemId)}/thumbnails`)
+
+  url.searchParams.set('select', size)
+  return url
+}
+
+function createThumbnailBatchRequestUrl(itemId: string, size: DriveThumbnailSize): string {
+  const searchParams = new URLSearchParams()
+
+  searchParams.set('select', size)
+  return `/me/drive/items/${encodeURIComponent(itemId)}/thumbnails?${searchParams.toString()}`
 }
 
 function createCopyUrl(itemId: string): URL {
@@ -3199,7 +4402,7 @@ async function graphGet<T>(url: URL, accessToken: string, extraHeaders: Record<s
     headers: extraHeaders
   })
 
-  return (await response.json()) as T
+  return readJsonResponse<T>(response, 'OneDrive 응답을 해석하지 못했습니다.')
 }
 
 async function graphSend<T>(url: URL, accessToken: string, init: GraphRequestInit): Promise<T> {
@@ -3209,7 +4412,7 @@ async function graphSend<T>(url: URL, accessToken: string, init: GraphRequestIni
     return undefined as T
   }
 
-  return (await response.json()) as T
+  return readJsonResponse<T>(response, 'OneDrive 응답을 해석하지 못했습니다.')
 }
 
 async function graphFetch(url: URL, accessToken: string, init: GraphRequestInit): Promise<Response> {
@@ -3223,10 +4426,32 @@ async function graphFetch(url: URL, accessToken: string, init: GraphRequestInit)
   })
 
   if (!response.ok) {
-    throw await createGraphResponseError(response)
+    const error = await createGraphResponseError(response)
+    emitGraphResponseError(error, url)
+    throw error
   }
 
   return response
+}
+
+async function readJsonResponse<T>(response: Response, fallbackMessage: string): Promise<T> {
+  const body = await response.text()
+  const trimmedBody = body.trim()
+
+  if (!trimmedBody) {
+    return undefined as T
+  }
+
+  try {
+    return JSON.parse(trimmedBody) as T
+  } catch (error) {
+    throw new GraphResponseError(
+      formatInvalidJsonResponseError(response, body, error, fallbackMessage),
+      response.status,
+      response.headers.get('Location'),
+      parseRetryAfterMs(response.headers)
+    )
+  }
 }
 
 async function getDriveId(accessToken: string): Promise<string> {
@@ -3258,6 +4483,22 @@ async function createGraphResponseError(response: Response): Promise<GraphRespon
   )
 }
 
+function emitGraphResponseError(error: GraphResponseError, url: URL): void {
+  const isThrottle = error.status === 429 || error.retryAfterMs !== undefined
+
+  emitGraphActivity({
+    level: isThrottle ? 'warning' : 'error',
+    scope: 'graph',
+    title: isThrottle ? 'OneDrive 요청 제한' : 'OneDrive 요청 실패',
+    message: isThrottle
+      ? `${formatRetryDelay(getRetryAfterDelayMs(error) ?? DEFAULT_THROTTLE_RETRY_DELAY_MS)} 후 다시 시도합니다.`
+      : error.message,
+    detail: `${url.pathname}${url.search ? ` ${redactGraphUrl(url.toString())}` : ''}\n${error.message}`,
+    status: error.status,
+    retryAfterMs: error.retryAfterMs
+  })
+}
+
 async function createResponseError(response: Response, fallbackMessage: string): Promise<GraphResponseError> {
   return new GraphResponseError(
     await formatGenericResponseError(response, fallbackMessage),
@@ -3268,13 +4509,7 @@ async function createResponseError(response: Response, fallbackMessage: string):
 }
 
 async function formatGraphError(response: Response): Promise<string> {
-  let graphError: GraphErrorResponse | null = null
-
-  try {
-    graphError = (await response.json()) as GraphErrorResponse
-  } catch {
-    graphError = null
-  }
+  const graphError = parseGraphError(await response.text())
 
   if (response.status === 401) {
     return '인증이 만료되었습니다. 다시 로그인하세요.'
@@ -3308,12 +4543,50 @@ async function formatGenericResponseError(response: Response, fallbackMessage: s
     return 'OneDrive 서비스가 응답하지 않습니다. 잠시 후 다시 시도하세요.'
   }
 
-  try {
-    const graphError = (await response.json()) as GraphErrorResponse
+  return parseGraphError(await response.text())?.error?.message ?? fallbackMessage
+}
 
-    return graphError.error?.message ?? fallbackMessage
+function parseGraphError(body: string): GraphErrorResponse | null {
+  try {
+    return JSON.parse(body) as GraphErrorResponse
   } catch {
-    return fallbackMessage
+    return null
+  }
+}
+
+function formatInvalidJsonResponseError(response: Response, body: string, error: unknown, fallbackMessage: string): string {
+  const details = [
+    `status=${response.status}`,
+    `content-type=${response.headers.get('content-type') ?? 'unknown'}`,
+    `url=${redactGraphUrl(response.url)}`,
+    `body=${formatBodySnippet(body)}`
+  ].join(', ')
+  const parseMessage = error instanceof Error ? error.message : fallbackMessage
+
+  return `Microsoft Graph 응답이 JSON 형식이 아닙니다. ${parseMessage}. ${details}`
+}
+
+function formatBodySnippet(body: string): string {
+  const snippet = body.trim().replace(/\s+/g, ' ').slice(0, 500)
+
+  return JSON.stringify(snippet || '<empty>')
+}
+
+function redactGraphUrl(value: string): string {
+  try {
+    const url = new URL(value)
+
+    for (const key of [...url.searchParams.keys()]) {
+      const normalizedKey = key.toLocaleLowerCase('en-US')
+
+      if (normalizedKey.includes('token')) {
+        url.searchParams.set(key, '<redacted>')
+      }
+    }
+
+    return url.toString()
+  } catch {
+    return value
   }
 }
 
@@ -3324,7 +4597,10 @@ function parseRetryAfterMs(headers: Headers): number | undefined {
     return retryAfterMs
   }
 
-  const retryAfter = headers.get('Retry-After')
+  return parseRetryAfterMsFromValue(headers.get('Retry-After'))
+}
+
+function parseRetryAfterMsFromValue(retryAfter: string | null): number | undefined {
   const retryAfterSeconds = Number(retryAfter)
 
   if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
@@ -3696,18 +4972,15 @@ function getRetryDelayMs(attemptCount: number, minimumDelayMs?: number): number 
 
 async function throttleDriveTransfers(delayMs: number): Promise<void> {
   const now = Date.now()
-  const settings = await getTransferSettings()
-  const configuredSlotLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, settings.maxConcurrentTransfers)
-  const currentSlotLimit = getEffectiveTransferSlotLimit(configuredSlotLimit)
-  const reducedSlotLimit = Math.max(
-    ADAPTIVE_TRANSFER_SLOT_MIN,
-    Math.ceil(currentSlotLimit * ADAPTIVE_TRANSFER_SLOT_DECREASE_FACTOR)
-  )
+  const normalizedDelayMs = Math.max(delayMs, TRANSFER_DISPATCH_DELAY_MS)
 
-  adaptiveTransferSlotLimit = Math.min(configuredSlotLimit, reducedSlotLimit)
-  lastTransferThrottleAt = now
-  lastTransferSlotIncreaseAt = Math.max(lastTransferSlotIncreaseAt, now)
-  transferThrottleUntil = Math.max(transferThrottleUntil, now + Math.max(delayMs, TRANSFER_DISPATCH_DELAY_MS))
+  transferThrottleUntil = Math.max(transferThrottleUntil, now + normalizedDelayMs)
+  emitGraphActivity({
+    level: 'warning',
+    scope: 'transfer',
+    title: '전송 요청 제한',
+    message: `OneDrive 전송 요청이 제한되어 ${formatRetryDelay(normalizedDelayMs)} 동안 새 요청을 늦춥니다.`
+  })
 }
 
 function getDriveTransferThrottleDelayMs(): number {
@@ -3754,37 +5027,11 @@ function createAbortError(): Error {
 }
 
 async function recordSuccessfulTransferCompletion(): Promise<void> {
-  const now = Date.now()
-  const settings = await getTransferSettings()
-  const configuredSlotLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, settings.maxConcurrentTransfers)
-  const currentSlotLimit = getEffectiveTransferSlotLimit(configuredSlotLimit)
-
-  if (currentSlotLimit >= configuredSlotLimit) {
-    return
-  }
-
-  if (now - lastTransferThrottleAt < ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS) {
-    return
-  }
-
-  if (now - lastTransferSlotIncreaseAt < ADAPTIVE_TRANSFER_SLOT_RECOVERY_INTERVAL_MS) {
-    return
-  }
-
-  adaptiveTransferSlotLimit = Math.min(configuredSlotLimit, currentSlotLimit + 1)
-  lastTransferSlotIncreaseAt = now
-
   scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
 }
 
 function getEffectiveTransferSlotLimit(configuredSlotLimit: number): number {
-  const normalizedConfiguredLimit = Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, Math.floor(configuredSlotLimit))
-
-  if (adaptiveTransferSlotLimit === null) {
-    return Math.min(normalizedConfiguredLimit, ADAPTIVE_TRANSFER_SLOT_INITIAL)
-  }
-
-  return Math.min(normalizedConfiguredLimit, Math.max(ADAPTIVE_TRANSFER_SLOT_MIN, Math.floor(adaptiveTransferSlotLimit)))
+  return Math.max(TRANSFER_SLOT_MIN, Math.floor(configuredSlotLimit))
 }
 
 function scheduleDriveTransferRetryWorker(delayMs = TRANSFER_RETRY_IDLE_DELAY_MS): void {
@@ -3822,6 +5069,7 @@ async function runDriveTransferRetryWorker(): Promise<void> {
   }
 
   let startedCount = 0
+  let startedRetryingCount = 0
 
   transferRetryWorkerPromise = (async () => {
     const throttleDelayMs = getDriveTransferThrottleDelayMs()
@@ -3837,12 +5085,38 @@ async function runDriveTransferRetryWorker(): Promise<void> {
       return
     }
 
-    const tasks = await findRetryableTransferTasks(Math.min(TRANSFER_RETRY_BATCH_LIMIT, availableSlots), false)
+    const tasks = await findRetryableTransferTasks(Math.min(TRANSFER_RETRY_BATCH_LIMIT, availableSlots), false, {
+      mode: 'non-retrying'
+    })
 
     for (const task of tasks) {
       if (task.status !== 'paused' && (await startDriveTransferTask(task, transferRetryProgressListener))) {
         startedCount += 1
       }
+    }
+
+    const remainingSlots = await getAvailableTransferSlots()
+
+    if (remainingSlots <= 0) {
+      return
+    }
+
+    const retryingStepDelayMs = getRetryingTransferDispatchDelayMs()
+
+    if (retryingStepDelayMs > 0) {
+      scheduleDriveTransferRetryWorker(retryingStepDelayMs)
+      return
+    }
+
+    const [retryingTask] = await findRetryableTransferTasks(1, false, {
+      mode: 'retrying',
+      minimumRetryingWaitMs: TRANSFER_RETRY_READY_WAIT_MS
+    })
+
+    if (retryingTask && (await startDriveTransferTask(retryingTask, transferRetryProgressListener))) {
+      startedCount += 1
+      startedRetryingCount += 1
+      nextRetryingTransferDispatchAt = Date.now() + TRANSFER_RETRY_STEP_DELAY_MS
     }
   })().finally(async () => {
     transferRetryWorkerPromise = null
@@ -3859,7 +5133,14 @@ async function runDriveTransferRetryWorker(): Promise<void> {
     }
 
     if (startedCount > 0) {
-      scheduleDriveTransferRetryWorker(TRANSFER_DISPATCH_DELAY_MS)
+      scheduleDriveTransferRetryWorker(startedRetryingCount > 0 ? TRANSFER_RETRY_STEP_DELAY_MS : TRANSFER_DISPATCH_DELAY_MS)
+      return
+    }
+
+    const nextRetryDelayMs = await getNextRetryingTransferReadyDelayMs(TRANSFER_RETRY_READY_WAIT_MS)
+
+    if (nextRetryDelayMs !== undefined) {
+      scheduleDriveTransferRetryWorker(Math.max(nextRetryDelayMs, getRetryingTransferDispatchDelayMs()))
       return
     }
 
@@ -3880,6 +5161,10 @@ async function getAvailableTransferSlots(): Promise<number> {
 
 function getOccupiedTransferSlotCount(): number {
   return new Set([...transferWorkerSlotIds, ...runningTransferIds]).size
+}
+
+function getRetryingTransferDispatchDelayMs(): number {
+  return Math.max(0, nextRetryingTransferDispatchAt - Date.now())
 }
 
 async function startDriveTransferTask(task: InternalDriveTransferTask, onProgress?: DriveTransferProgressListener): Promise<boolean> {
@@ -3998,6 +5283,42 @@ function parseGraphUrl(value: string, errorMessage: string): URL {
   }
 
   return url
+}
+
+function parseDriveDeltaUrl(value: string, errorMessage: string): URL {
+  const url = parseGraphUrl(value, errorMessage)
+
+  if (!isDriveDeltaUrl(url)) {
+    throw new Error(errorMessage)
+  }
+
+  return url
+}
+
+function parseStoredDriveDeltaUrl(value: string | null | undefined): URL | null {
+  if (!value) {
+    return null
+  }
+
+  try {
+    return parseDriveDeltaUrl(value, '저장된 OneDrive delta cursor가 올바르지 않습니다.')
+  } catch {
+    return null
+  }
+}
+
+function normalizeDriveDeltaLink(value: string | undefined): string | undefined {
+  return parseStoredDriveDeltaUrl(value)?.toString()
+}
+
+function isDriveDeltaUrl(url: URL): boolean {
+  if (url.protocol !== 'https:' || url.hostname !== 'graph.microsoft.com') {
+    return false
+  }
+
+  const pathname = url.pathname.toLocaleLowerCase('en-US')
+
+  return /\/drive\/root\/delta(?:$|\()/.test(pathname) || /\/drives\/[^/]+\/root\/delta(?:$|\()/.test(pathname)
 }
 
 function parseTrustedCopyMonitorUrl(value: string): URL {
@@ -4422,7 +5743,11 @@ async function* iterateAllDriveTransferTasks(): AsyncGenerator<InternalDriveTran
   }
 }
 
-async function findRetryableTransferTasks(limit: number, includePaused: boolean): Promise<InternalDriveTransferTask[]> {
+async function findRetryableTransferTasks(
+  limit: number,
+  includePaused: boolean,
+  options: TransferRetryCandidateOptions = {}
+): Promise<InternalDriveTransferTask[]> {
   const index = await readDriveTransferIndex()
   const tasks: InternalDriveTransferTask[] = []
   const activeAccountId = await getActiveAccountId()
@@ -4444,12 +5769,36 @@ async function findRetryableTransferTasks(limit: number, includePaused: boolean)
 
     const task = await readDriveTransferTask(taskId)
 
-    if (task && isDriveTransferTaskForAccount(task, activeAccountId) && isTransferReadyToRun(task, includePaused)) {
+    if (task && isDriveTransferTaskForAccount(task, activeAccountId) && isTransferReadyToRun(task, includePaused, options)) {
       tasks.push(task)
     }
   }
 
   return tasks
+}
+
+async function getNextRetryingTransferReadyDelayMs(minimumRetryingWaitMs: number): Promise<number | undefined> {
+  const index = await readDriveTransferIndex()
+  const activeAccountId = await getActiveAccountId()
+  const now = Date.now()
+  let nextDelayMs: number | undefined
+
+  for (const taskId of index.taskIds) {
+    if (!taskId || transferWorkerSlotIds.has(taskId) || runningTransferIds.has(taskId)) {
+      continue
+    }
+
+    const task = await readDriveTransferTask(taskId)
+
+    if (!task || task.status !== 'retrying' || !isDriveTransferTaskForAccount(task, activeAccountId)) {
+      continue
+    }
+
+    const delayMs = Math.max(TRANSFER_DISPATCH_DELAY_MS, getRetryingTransferReadyAt(task, minimumRetryingWaitMs) - now)
+    nextDelayMs = nextDelayMs === undefined ? delayMs : Math.min(nextDelayMs, delayMs)
+  }
+
+  return nextDelayMs
 }
 
 function isDriveTransferTaskForAccount(task: InternalDriveTransferTask, activeAccountId: string | null): boolean {
@@ -4460,8 +5809,20 @@ function isDriveTransferTaskForAccount(task: InternalDriveTransferTask, activeAc
   return !task.accountId || task.accountId === activeAccountId
 }
 
-function isTransferReadyToRun(task: InternalDriveTransferTask, includePaused: boolean): boolean {
+function isTransferReadyToRun(
+  task: InternalDriveTransferTask,
+  includePaused: boolean,
+  options: TransferRetryCandidateOptions = {}
+): boolean {
   if (task.status === 'completed' || transferWorkerSlotIds.has(task.id) || runningTransferIds.has(task.id)) {
+    return false
+  }
+
+  if (options.mode === 'non-retrying' && task.status === 'retrying') {
+    return false
+  }
+
+  if (options.mode === 'retrying' && task.status !== 'retrying') {
     return false
   }
 
@@ -4473,11 +5834,23 @@ function isTransferReadyToRun(task: InternalDriveTransferTask, includePaused: bo
     return true
   }
 
+  if (task.status === 'retrying' && getRetryingTransferReadyAt(task, options.minimumRetryingWaitMs ?? 0) > Date.now()) {
+    return false
+  }
+
   if (!task.nextRetryAt) {
     return task.status === 'queued' || task.status === 'retrying' || task.status === 'failed'
   }
 
   return new Date(task.nextRetryAt).getTime() <= Date.now()
+}
+
+function getRetryingTransferReadyAt(task: InternalDriveTransferTask, minimumRetryingWaitMs: number): number {
+  const nextRetryAt = task.nextRetryAt ? Date.parse(task.nextRetryAt) : 0
+  const updatedAt = Date.parse(task.updatedAt)
+  const minimumReadyAt = Number.isFinite(updatedAt) ? updatedAt + minimumRetryingWaitMs : 0
+
+  return Math.max(Number.isFinite(nextRetryAt) ? nextRetryAt : 0, minimumReadyAt)
 }
 
 function sortTransferTasks(tasks: InternalDriveTransferTask[]): InternalDriveTransferTask[] {
@@ -4574,17 +5947,29 @@ async function readDriveIndex(accountId?: string | null): Promise<DriveIndex> {
   const normalizedAccountId = accountId ?? (await getActiveAccountId())
 
   if (!normalizedAccountId) {
-    return createEmptyIndex()
+    return createEmptyDriveIndex()
   }
 
   try {
-    const index = normalizeStoredDriveIndex(JSON.parse(await readFile(await getDriveIndexPath(normalizedAccountId), 'utf8')))
+    const index = await readDriveIndexFromStore(normalizedAccountId)
 
     if (index) {
       return index
     }
   } catch {
-    // Missing or invalid indexes are rebuilt from Graph delta.
+    // Missing or invalid SQLite indexes are rebuilt from Graph delta.
+  }
+
+  try {
+    const legacyIndex = normalizeStoredDriveIndex(JSON.parse(await readFile(getLegacyAccountDriveIndexPath(normalizedAccountId), 'utf8')))
+
+    if (legacyIndex) {
+      await writeDriveIndex(legacyIndex, normalizedAccountId)
+      await unlinkIfExists(getLegacyAccountDriveIndexPath(normalizedAccountId))
+      return legacyIndex
+    }
+  } catch {
+    // Per-account JSON indexes were used before the SQLite index store.
   }
 
   try {
@@ -4599,7 +5984,7 @@ async function readDriveIndex(accountId?: string | null): Promise<DriveIndex> {
     // Legacy index may not exist.
   }
 
-  return createEmptyIndex()
+  return createEmptyDriveIndex()
 }
 
 async function getCurrentDriveIndex(accountId?: string | null): Promise<DriveIndex> {
@@ -4621,20 +6006,10 @@ async function getCurrentDriveIndex(accountId?: string | null): Promise<DriveInd
 
 async function writeDriveIndex(index: DriveIndex, accountId?: string | null): Promise<void> {
   const normalizedAccountId = accountId ?? (await getActiveAccountId())
-  const indexPath = await getDriveIndexPath(normalizedAccountId)
 
   activeDriveIndexSnapshot = index
   activeDriveIndexSnapshotAccountId = normalizedAccountId
-  await writeJsonAtomic(indexPath, index)
-}
-
-function createEmptyIndex(rootItemId?: string): DriveIndex {
-  return {
-    version: 1,
-    rootItemId,
-    expandedFolderIds: {},
-    items: {}
-  }
+  await writeDriveIndexToStore(index, normalizedAccountId)
 }
 
 function normalizeStoredDriveIndex(value: unknown): DriveIndex | null {
@@ -4652,26 +6027,8 @@ function normalizeStoredDriveIndex(value: unknown): DriveIndex | null {
   }
 }
 
-function getDriveIndexesDirectory(): string {
-  return join(app.getPath('userData'), DRIVE_INDEXES_DIR_NAME)
-}
-
 function getLegacyDriveIndexPath(): string {
   return join(app.getPath('userData'), DRIVE_INDEX_LEGACY_FILE_NAME)
-}
-
-async function getDriveIndexPath(accountId?: string | null): Promise<string> {
-  const normalizedAccountId = accountId ?? (await getActiveAccountId())
-
-  if (!normalizedAccountId) {
-    throw new Error('Microsoft 계정 로그인이 필요합니다.')
-  }
-
-  return join(getDriveIndexesDirectory(), encodeAccountIdForPath(normalizedAccountId), DRIVE_INDEX_LEGACY_FILE_NAME)
-}
-
-function encodeAccountIdForPath(accountId: string): string {
-  return Buffer.from(accountId, 'utf8').toString('base64url')
 }
 
 function getLegacyDriveTransfersPath(): string {
@@ -4680,6 +6037,20 @@ function getLegacyDriveTransfersPath(): string {
 
 function getDriveTransfersDirectory(): string {
   return join(app.getPath('userData'), DRIVE_TRANSFERS_DIR_NAME)
+}
+
+function getDriveThumbnailCacheDirectory(): string {
+  return join(app.getPath('userData'), DRIVE_THUMBNAIL_CACHE_DIR_NAME)
+}
+
+function getDriveThumbnailCachePaths(cacheKey: string): { dataPath: string; metadataPath: string } {
+  const cacheId = createHash('sha256').update(cacheKey).digest('hex')
+  const cacheDirectory = getDriveThumbnailCacheDirectory()
+
+  return {
+    dataPath: join(cacheDirectory, `${cacheId}.bin`),
+    metadataPath: join(cacheDirectory, `${cacheId}.json`)
+  }
 }
 
 function getAccountTransferTempPath(taskId: string): string {

@@ -14,12 +14,16 @@ import {
   listDriveTransferPage,
   listDriveTransfers,
   listDriveChildren,
+  getDriveItemThumbnail,
   moveDriveItems,
   renameDriveItem,
   reconcileComparedDriveFolders,
   resetDriveIndex,
+  resetDriveThumbnailCache,
   resetDriveTransfers,
   resumeDriveTransfers,
+  searchDriveItems,
+  setGraphActivityListener,
   startDriveTransferRetryScheduler,
   stopDriveTransfer,
   transferDriveItemsBetweenAccounts,
@@ -30,8 +34,10 @@ import {
 import { getAppEnvironment } from './platform'
 import {
   getMicrosoftAuthSettings,
+  getDriveSettings,
   getTransferSettings,
   resetMicrosoftAuthSettings,
+  updateDriveSettings,
   updateMicrosoftAuthSettings,
   updateTransferSettings
 } from './settings'
@@ -44,6 +50,9 @@ import type {
   DriveFolderCompareRequest,
   DriveFolderReconcileRequest,
   DriveIndexWarmRequest,
+  DriveSettingsInput,
+  DriveSearchRequest,
+  DriveThumbnailRequest,
   DriveTransferListRequest,
   MicrosoftAuthSettingsInput,
   MoveDriveItemsRequest,
@@ -105,6 +114,7 @@ if (!hasSingleInstanceLock) {
   ipcMain.handle('app:getEnvironment', () => getAppEnvironment())
   ipcMain.handle('settings:getMicrosoftAuth', () => getMicrosoftAuthSettings())
   ipcMain.handle('settings:getTransfer', () => getTransferSettings())
+  ipcMain.handle('settings:getDrive', () => getDriveSettings())
   ipcMain.handle('settings:updateMicrosoftAuth', async (_event, input: MicrosoftAuthSettingsInput) => {
     const settings = await updateMicrosoftAuthSettings(input)
     resetAuthClient()
@@ -116,9 +126,13 @@ if (!hasSingleInstanceLock) {
     wakeDriveTransferQueue()
     return settings
   })
+  ipcMain.handle('settings:updateDrive', async (_event, input: DriveSettingsInput) => {
+    return updateDriveSettings(input)
+  })
   ipcMain.handle('settings:resetAll', async () => {
     await resetAuthCache()
     await resetDriveIndex()
+    await resetDriveThumbnailCache()
     await resetDriveTransfers()
     await resetMicrosoftAuthSettings()
     await session.defaultSession.clearStorageData()
@@ -158,6 +172,12 @@ if (!hasSingleInstanceLock) {
   })
   ipcMain.handle('onedrive:warmIndex', (_event, request?: DriveIndexWarmRequest) => {
     return warmDriveIndex(request?.forceRefresh ?? false)
+  })
+  ipcMain.handle('onedrive:searchItems', (_event, request: DriveSearchRequest) => {
+    return searchDriveItems(request)
+  })
+  ipcMain.handle('onedrive:getThumbnail', (_event, request: DriveThumbnailRequest) => {
+    return getDriveItemThumbnail(request)
   })
   ipcMain.handle('onedrive:compareFolders', (_event, request: DriveFolderCompareRequest) => {
     return compareDriveFolders(request)
@@ -273,6 +293,7 @@ if (!hasSingleInstanceLock) {
   })
 
   void app.whenReady().then(() => {
+    setGraphActivityListener(broadcastGraphActivity)
     applyRuntimeAppIcon()
     createWindow()
     startDriveTransferRetryScheduler(broadcastTransferUpdates)
@@ -303,6 +324,14 @@ function broadcastTransferUpdates(tasks: unknown): void {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.webContents.isDestroyed()) {
       window.webContents.send('transfers:updated', tasks)
+    }
+  }
+}
+
+function broadcastGraphActivity(event: unknown): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.webContents.isDestroyed()) {
+      window.webContents.send('graph:activity', event)
     }
   }
 }

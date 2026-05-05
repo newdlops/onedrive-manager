@@ -2,6 +2,8 @@ import { app } from 'electron'
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type {
+  DriveSettings,
+  DriveSettingsInput,
   MicrosoftAuthSettings,
   MicrosoftAuthSettingsInput,
   MicrosoftAuthSettingsSource,
@@ -12,6 +14,7 @@ import type {
 const SETTINGS_FILE_NAME = 'settings.json'
 const DEFAULT_TENANT_ID = 'consumers'
 const DEFAULT_MAX_CONCURRENT_TRANSFERS = 4
+const DEFAULT_DRIVE_INDEX_MODE: DriveSettings['indexMode'] = 'automatic'
 const MIN_CONCURRENT_TRANSFERS = 1
 const MAX_ALLOWED_CONCURRENT_TRANSFERS = 64
 const PLACEHOLDER_CLIENT_ID = '00000000-0000-0000-0000-000000000000'
@@ -26,6 +29,9 @@ type PersistedSettings = {
   }
   transfer?: {
     maxConcurrentTransfers?: number
+  }
+  drive?: {
+    indexMode?: DriveSettings['indexMode']
   }
 }
 
@@ -105,6 +111,27 @@ export async function updateTransferSettings(input: TransferSettingsInput): Prom
   return getTransferSettings()
 }
 
+export async function getDriveSettings(): Promise<DriveSettings> {
+  const persistedSettings = await readPersistedSettings()
+
+  return createDriveSettings(persistedSettings.drive?.indexMode)
+}
+
+export async function updateDriveSettings(input: DriveSettingsInput): Promise<DriveSettings> {
+  const persistedSettings = await readPersistedSettings()
+  const indexMode = normalizeDriveIndexMode(input.indexMode)
+
+  await writePersistedSettings({
+    ...persistedSettings,
+    version: 1,
+    drive: {
+      indexMode
+    }
+  })
+
+  return getDriveSettings()
+}
+
 function getEnvironmentAuthSettings(): { clientId: string; tenantId: string } {
   const clientId = normalizeClientId(
     import.meta.env.MAIN_VITE_MICROSOFT_CLIENT_ID ||
@@ -151,6 +178,16 @@ function createTransferSettings(value: number | undefined): TransferSettings {
     minConcurrentTransfers: MIN_CONCURRENT_TRANSFERS,
     maxAllowedConcurrentTransfers: MAX_ALLOWED_CONCURRENT_TRANSFERS
   }
+}
+
+function createDriveSettings(indexMode: DriveSettings['indexMode'] | undefined): DriveSettings {
+  return {
+    indexMode: normalizeDriveIndexMode(indexMode)
+  }
+}
+
+function normalizeDriveIndexMode(indexMode: DriveSettings['indexMode'] | undefined): DriveSettings['indexMode'] {
+  return indexMode === 'manual' ? 'manual' : DEFAULT_DRIVE_INDEX_MODE
 }
 
 function normalizeConcurrentTransfers(value: number | undefined): number {

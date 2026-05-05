@@ -39,6 +39,8 @@ npm run dist:win
 
 `dist:win`은 macOS에서도 기본 cross-build 용도로 실행할 수 있지만, 설치 프로그램과 서명, 파일시스템 동작은 플랫폼 영향을 받으므로 릴리스 빌드는 Windows CI에서 확인합니다.
 
+`dist:mac`은 Intel Mac과 Apple Silicon Mac을 모두 지원하는 universal DMG를 `release/`에 생성합니다.
+
 ## Microsoft 계정 로그인 설정
 
 Microsoft Entra에서 데스크톱 public client 앱을 등록한 뒤 빌드 환경에 Application client ID를 주입합니다. Application client ID는 OAuth public client 식별자이며 client secret이 아니지만, 저장소에는 올리지 않습니다.

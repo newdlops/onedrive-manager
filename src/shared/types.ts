@@ -42,6 +42,16 @@ export type TransferSettingsInput = {
   maxConcurrentTransfers: number
 }
 
+export type DriveIndexMode = 'automatic' | 'manual'
+
+export type DriveSettings = {
+  indexMode: DriveIndexMode
+}
+
+export type DriveSettingsInput = {
+  indexMode: DriveIndexMode
+}
+
 export type AuthSession = {
   isConfigured: boolean
   isAuthenticated: boolean
@@ -79,6 +89,9 @@ export type CloudDriveItem = {
   parentId?: string
   childCount?: number
   mimeType?: string
+  quickXorHash?: string
+  cTag?: string
+  eTag?: string
 }
 
 export type DriveFolderRef = {
@@ -100,6 +113,57 @@ export type DriveChildrenResult = {
 
 export type DriveIndexWarmRequest = {
   forceRefresh?: boolean
+}
+
+export type GraphActivityLevel = 'info' | 'success' | 'warning' | 'error'
+
+export type GraphActivityScope = 'index' | 'thumbnail' | 'transfer' | 'graph'
+
+export type GraphActivityProgress = {
+  current?: number
+  total?: number
+  indeterminate?: boolean
+}
+
+export type GraphActivityEvent = {
+  id: string
+  at: string
+  level: GraphActivityLevel
+  scope: GraphActivityScope
+  title: string
+  message: string
+  detail?: string
+  progress?: GraphActivityProgress
+  status?: number
+  retryAfterMs?: number
+}
+
+export type DriveSearchRequest = {
+  query: string
+  limit?: number
+}
+
+export type DriveSearchResult = {
+  items: CloudDriveItem[]
+}
+
+export type DriveThumbnailSize = 'small' | 'medium' | 'large' | 'c160x120_crop' | `c${number}x${number}` | `c${number}x${number}_crop`
+
+export type DriveThumbnailRequest = {
+  accountId?: string | null
+  itemId: string
+  cacheKey?: string
+  priority?: 'normal' | 'high'
+  size?: DriveThumbnailSize
+  cacheOnly?: boolean
+}
+
+export type DriveThumbnailResult = {
+  itemId: string
+  status: 'ready' | 'missing'
+  url?: string
+  width?: number
+  height?: number
 }
 
 export type DriveIndexStatus = {

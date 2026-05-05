@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Dispatch, DragEvent, MouseEvent as ReactMouseEvent, ReactElement, SetStateAction } from 'react'
+import type {
+  Dispatch,
+  DragEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactElement,
+  SetStateAction,
+  WheelEvent as ReactWheelEvent
+} from 'react'
 import type {
   AppEnvironment,
   AuthAccount,
@@ -15,6 +23,9 @@ import type {
   DriveTransferTask,
   DriveIndexStatus,
   DriveFolderRef,
+  DriveThumbnailSize,
+  DriveSettings,
+  GraphActivityEvent,
   MicrosoftAuthSettingsSource,
   TransferDriveItemRef,
   TransferSettings
@@ -74,6 +85,12 @@ type TransferViewerState =
   | { status: 'ready'; offset: number; limit: number; result: DriveTransferListResult }
   | { status: 'error'; offset: number; limit: number; result: DriveTransferListResult | null; message: string }
 
+type DrivePreviewState = {
+  tabId: string
+  accountId: string | null
+  item: CloudDriveItem
+}
+
 type DriveSelectionMode = 'replace' | 'toggle' | 'range' | 'context'
 
 type DriveClipboardMode = 'copy' | 'cut'
@@ -116,6 +133,26 @@ type DriveSortOptions = {
   foldersFirst: boolean
 }
 
+type DriveViewMode = 'details' | 'large-icons'
+
+type ThumbnailPreviewState =
+  | { status: 'idle' | 'loading' | 'missing' | 'error' }
+  | { status: 'ready'; url: string; width?: number; height?: number }
+
+type PreviewTransform = {
+  scale: number
+  x: number
+  y: number
+}
+
+type PreviewPanSession = {
+  pointerId: number
+  originX: number
+  originY: number
+  startX: number
+  startY: number
+}
+
 type DriveColumnKey = 'name' | 'modified' | 'type' | 'size'
 
 type DriveColumnWidths = Record<DriveColumnKey, number>
@@ -148,6 +185,7 @@ type DriveTab = {
   driveState: DriveState
   indexState: IndexState
   sortOptions: DriveSortOptions
+  viewMode: DriveViewMode
   columnWidths: DriveColumnWidths
   paneSize: number
 }
@@ -218,6 +256,14 @@ const driveColumnLabels: Record<DriveColumnKey, string> = {
   size: '크기'
 }
 
+const driveViewModeLabels: Record<DriveViewMode, string> = {
+  details: '목록',
+  'large-icons': '큰 아이콘'
+}
+
+const imageFileExtensions = new Set(['avif', 'bmp', 'gif', 'heic', 'heif', 'jpeg', 'jpg', 'png', 'tif', 'tiff', 'webp'])
+const videoFileExtensions = new Set(['avi', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'webm', 'wmv'])
+
 const defaultDriveColumnWidths: DriveColumnWidths = {
   name: 280,
   modified: 150,
@@ -245,11 +291,24 @@ const PANE_RESIZE_HANDLE_WIDTH = 6
 const TRANSFER_VIEW_PAGE_LIMIT = 100
 const TRANSFER_UI_REFRESH_INTERVAL_MS = 3_000
 const FOLDER_COMPARE_PAGE_SIZE = 200
+const DRIVE_PREVIEW_THUMBNAIL_MIN_WIDTH = 640
+const DRIVE_PREVIEW_THUMBNAIL_MIN_HEIGHT = 480
+const DRIVE_PREVIEW_THUMBNAIL_MAX_WIDTH = 1280
+const DRIVE_PREVIEW_THUMBNAIL_MAX_HEIGHT = 960
+const DRIVE_PREVIEW_THUMBNAIL_MAX_PIXEL_RATIO = 1.5
+const DRIVE_PREVIEW_THUMBNAIL_WAIT_MS = 7_000
+const DRIVE_PREVIEW_ZOOM_MIN = 1
+const DRIVE_PREVIEW_ZOOM_MAX = 5
+const DRIVE_PREVIEW_ZOOM_STEP = 0.25
 const DEFAULT_TRANSFER_SETTINGS: TransferSettings = {
   maxConcurrentTransfers: 4,
   minConcurrentTransfers: 1,
   maxAllowedConcurrentTransfers: 64
 }
+const DEFAULT_DRIVE_SETTINGS: DriveSettings = {
+  indexMode: 'automatic'
+}
+const MAX_GRAPH_ACTIVITY_EVENTS = 200
 
 const PLACEHOLDER_CLIENT_ID = '00000000-0000-0000-0000-000000000000'
 const CLIENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -337,6 +396,9 @@ export function App(): ReactElement {
   const [transferTasks, setTransferTasks] = useState<DriveTransferTask[]>([])
   const [transferSummary, setTransferSummary] = useState<DriveTransferSummary | null>(null)
   const [transferSettings, setTransferSettings] = useState<TransferSettings>(DEFAULT_TRANSFER_SETTINGS)
+  const [driveSettings, setDriveSettings] = useState<DriveSettings>(DEFAULT_DRIVE_SETTINGS)
+  const [graphActivityEvents, setGraphActivityEvents] = useState<GraphActivityEvent[]>([])
+  const [isGraphActivityLogOpen, setIsGraphActivityLogOpen] = useState(false)
   const [transferViewerState, setTransferViewerState] = useState<TransferViewerState>({
     status: 'closed',
     offset: 0,
@@ -353,6 +415,7 @@ export function App(): ReactElement {
     target: null,
     result: null
   })
+  const [drivePreview, setDrivePreview] = useState<DrivePreviewState | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
@@ -467,6 +530,18 @@ export function App(): ReactElement {
     }
   }, [])
 
+  const loadDriveSettings = useCallback(async (): Promise<void> => {
+    if (typeof window.oneDriveManager.getDriveSettings !== 'function') {
+      return
+    }
+
+    try {
+      setDriveSettings(await window.oneDriveManager.getDriveSettings())
+    } catch {
+      setDriveSettings(DEFAULT_DRIVE_SETTINGS)
+    }
+  }, [])
+
   const refreshEnvironment = useCallback(async (): Promise<void> => {
     setEnvironmentState({ status: 'loading' })
 
@@ -481,7 +556,11 @@ export function App(): ReactElement {
     }
   }, [])
 
-  const warmNavigationIndex = useCallback(async (forceRefresh = false, tabId = activeTabId): Promise<boolean> => {
+  const warmNavigationIndex = useCallback(async (forceRefresh = false, tabId = activeTabId, isManualRequest = false): Promise<boolean> => {
+    if (driveSettings.indexMode === 'manual' && !isManualRequest) {
+      return true
+    }
+
     setIndexStateForTab(setTabs, tabId, (currentState) => {
       if (currentState.status === 'ready') {
         return { status: 'syncing', index: currentState.index }
@@ -505,11 +584,12 @@ export function App(): ReactElement {
       })
       return false
     }
-  }, [activeTabId])
+  }, [activeTabId, driveSettings.indexMode])
 
   const initialize = useCallback(async (): Promise<void> => {
     await refreshEnvironment()
     await loadTransferSettings()
+    await loadDriveSettings()
     const session = await loadSession()
 
     if (session?.isAuthenticated) {
@@ -519,7 +599,7 @@ export function App(): ReactElement {
       void warmNavigationIndex(false, activeTabId)
       await loadDriveFolder([rootFolder], { accountId, tabId: activeTabId })
     }
-  }, [loadDriveFolder, loadSession, loadTransferSettings, refreshEnvironment, warmNavigationIndex])
+  }, [loadDriveFolder, loadDriveSettings, loadSession, loadTransferSettings, refreshEnvironment, warmNavigationIndex])
 
   useEffect(() => {
     void initialize()
@@ -636,6 +716,16 @@ export function App(): ReactElement {
 
       dispose()
     }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window.oneDriveManager.onGraphActivity !== 'function') {
+      return undefined
+    }
+
+    return window.oneDriveManager.onGraphActivity((event) => {
+      setGraphActivityEvents((currentEvents) => [event, ...currentEvents].slice(0, MAX_GRAPH_ACTIVITY_EVENTS))
+    })
   }, [])
 
   useEffect(() => {
@@ -874,10 +964,41 @@ export function App(): ReactElement {
     }
   }
 
-  async function downloadItemInTab(tabId: string, item: CloudDriveItem): Promise<void> {
-    if (await activateDriveTabById(tabId)) {
-      await downloadSelectedItems([item])
-    }
+  function previewItemInTab(tabId: string, item: CloudDriveItem): void {
+    const tab = tabs.find((candidate) => candidate.id === tabId)
+
+    setContextMenu(null)
+    setActiveTabId(tabId)
+    setDrivePreview({
+      tabId,
+      accountId: tab?.accountId ?? session?.activeAccountId ?? null,
+      item
+    })
+  }
+
+  function moveDrivePreview(direction: -1 | 1): void {
+    setDrivePreview((currentPreview) => {
+      if (!currentPreview) {
+        return null
+      }
+
+      const tab = tabs.find((candidate) => candidate.id === currentPreview.tabId)
+      const previewItems = tab ? getDrivePreviewItems(tab) : [currentPreview.item]
+
+      if (previewItems.length <= 1) {
+        return currentPreview
+      }
+
+      const currentIndex = previewItems.findIndex((candidate) => candidate.id === currentPreview.item.id)
+      const nextIndex = currentIndex >= 0 ? (currentIndex + direction + previewItems.length) % previewItems.length : 0
+      const nextItem = previewItems[nextIndex] ?? currentPreview.item
+
+      return {
+        tabId: currentPreview.tabId,
+        accountId: tab?.accountId ?? currentPreview.accountId,
+        item: nextItem
+      }
+    })
   }
 
   async function renameItemInTab(tabId: string, item: CloudDriveItem): Promise<void> {
@@ -1795,6 +1916,49 @@ export function App(): ReactElement {
     await loadDriveFolder(folderPath, { forceRefresh: true })
   }
 
+  async function runManualIndexRefresh(): Promise<void> {
+    if (!canUseDrive || isFileOperationBusy) {
+      return
+    }
+
+    setContextMenu(null)
+    setFileOperationState({ status: 'working', message: '탐색 인덱스 수동 갱신 중' })
+
+    const didStart = await warmNavigationIndex(true, activeTabId, true)
+
+    setFileOperationState({
+      status: didStart ? 'success' : 'error',
+      message: didStart ? '탐색 인덱스 갱신을 시작했습니다.' : '탐색 인덱스 갱신을 시작하지 못했습니다.'
+    })
+  }
+
+  async function toggleDriveIndexMode(): Promise<void> {
+    if (typeof window.oneDriveManager.updateDriveSettings !== 'function') {
+      return
+    }
+
+    const nextIndexMode = driveSettings.indexMode === 'automatic' ? 'manual' : 'automatic'
+
+    try {
+      const nextSettings = await window.oneDriveManager.updateDriveSettings({ indexMode: nextIndexMode })
+
+      setDriveSettings(nextSettings)
+      setFileOperationState({
+        status: 'success',
+        message: nextSettings.indexMode === 'automatic' ? '탐색 인덱스를 자동으로 갱신합니다.' : '탐색 인덱스를 수동으로만 갱신합니다.'
+      })
+
+      if (nextSettings.indexMode === 'automatic') {
+        void warmNavigationIndex(false, activeTabId, true)
+      }
+    } catch (error) {
+      setFileOperationState({
+        status: 'error',
+        message: error instanceof Error ? error.message : '탐색 인덱스 설정을 저장하지 못했습니다.'
+      })
+    }
+  }
+
   async function saveAuthSettings(): Promise<void> {
     setIsSavingSettings(true)
     setSettingsError(null)
@@ -1951,7 +2115,9 @@ export function App(): ReactElement {
     canUseActiveTabDrive && folderCompareSource && (!contextMenuTargetItem || contextMenuTargetItem.type === 'folder')
   )
   const folderCompareTargetLabel = contextMenuTargetItem?.type === 'folder' ? '선택 폴더와 비교' : '현재 폴더와 비교'
+  const previewItemCount = drivePreview ? getDrivePreviewItems(tabs.find((tab) => tab.id === drivePreview.tabId)).length : 0
   const cutItemIds = driveClipboard?.mode === 'cut' ? driveClipboard.items.map((item) => item.id) : []
+  const latestGraphActivityEvent = graphActivityEvents[0] ?? null
 
   return (
     <main className="explorer-shell">
@@ -1998,6 +2164,17 @@ export function App(): ReactElement {
           onClick={() => void refreshCurrentFolder()}
         >
           새로고침
+        </button>
+        <button
+          className="command-button"
+          type="button"
+          disabled={!canUseDrive || isFileOperationBusy || indexState.status === 'syncing'}
+          onClick={() => void runManualIndexRefresh()}
+        >
+          인덱스 갱신
+        </button>
+        <button className="command-button" type="button" disabled={isFileOperationBusy} onClick={() => void toggleDriveIndexMode()}>
+          {driveSettings.indexMode === 'automatic' ? '인덱스 자동' : '인덱스 수동'}
         </button>
         <button className="command-button" type="button" disabled={!canUseDrive || isFileOperationBusy} onClick={() => void createNewDriveTab()}>
           새 탭
@@ -2170,9 +2347,12 @@ export function App(): ReactElement {
                   onColumnWidthsChange={(nextColumnWidths) => {
                     setColumnWidthsForTab(setTabs, tab.id, nextColumnWidths)
                   }}
+                  onViewModeChange={(nextViewMode) => {
+                    setViewModeForTab(setTabs, tab.id, nextViewMode)
+                  }}
                   onSelectItem={(item, mode) => selectDriveItemInTab(tab.id, item, mode)}
                   onOpenFolder={(item) => void openFolderInTab(tab.id, item)}
-                  onDownloadItem={(item) => void downloadItemInTab(tab.id, item)}
+                  onPreviewItem={(item) => previewItemInTab(tab.id, item)}
                   onRenameItem={(item) => void renameItemInTab(tab.id, item)}
                   onDeleteItem={(item) => void deleteItemInTab(tab.id, item)}
                   onDragOverFolderChange={setDragOverFolderId}
@@ -2240,6 +2420,16 @@ export function App(): ReactElement {
         />
       ) : null}
 
+      {drivePreview ? (
+        <DrivePreviewDialog
+          preview={drivePreview}
+          hasMultipleItems={previewItemCount > 1}
+          onClose={() => setDrivePreview(null)}
+          onPrevious={() => moveDrivePreview(-1)}
+          onNext={() => moveDrivePreview(1)}
+        />
+      ) : null}
+
       {transferViewerState.status !== 'closed' ? (
         <TransferViewerDialog
           state={transferViewerState}
@@ -2261,7 +2451,15 @@ export function App(): ReactElement {
         />
       ) : null}
 
+      {isGraphActivityLogOpen ? (
+        <GraphActivityDialog events={graphActivityEvents} onClose={() => setIsGraphActivityLogOpen(false)} />
+      ) : null}
+
       <footer className="status-bar">
+        <button className="status-bar-main" type="button" onClick={() => setIsGraphActivityLogOpen(true)}>
+          <span>{latestGraphActivityEvent ? formatGraphActivityStatus(latestGraphActivityEvent) : getDriveStatusText(driveState, indexState)}</span>
+          {latestGraphActivityEvent?.progress ? <GraphActivityProgressBar event={latestGraphActivityEvent} /> : null}
+        </button>
         <span>{getDriveStatusText(driveState, indexState)}</span>
         <span>{environment ? platformLabels[environment.platform.name] ?? environment.platform.name : getEnvironmentStatus(environmentState)}</span>
       </footer>
@@ -2456,6 +2654,293 @@ function ExplorerContextMenu({
       <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onRefresh}>
         새로고침
       </button>
+    </div>
+  )
+}
+
+function DrivePreviewDialog({
+  preview,
+  hasMultipleItems,
+  onClose,
+  onPrevious,
+  onNext
+}: {
+  preview: DrivePreviewState
+  hasMultipleItems: boolean
+  onClose: () => void
+  onPrevious: () => void
+  onNext: () => void
+}): ReactElement {
+  const item = preview.item
+  const previewKind = getDriveItemPreviewKind(item)
+  const thumbnailCacheKey = `${getDriveThumbnailCacheKey(item)}:${getDrivePreviewThumbnailSize()}`
+  const previewStageRef = useRef<HTMLDivElement | null>(null)
+  const previewImageRef = useRef<HTMLImageElement | null>(null)
+  const previewPanSessionRef = useRef<PreviewPanSession | null>(null)
+  const [thumbnailState, setThumbnailState] = useState<ThumbnailPreviewState>({ status: 'loading' })
+  const [previewTransform, setPreviewTransform] = useState<PreviewTransform>({ scale: 1, x: 0, y: 0 })
+  const canTransformPreview = thumbnailState.status === 'ready'
+  const canPanPreview = canTransformPreview && previewTransform.scale > DRIVE_PREVIEW_ZOOM_MIN
+
+  useEffect(() => {
+    let isCancelled = false
+    let hasTimedOut = false
+    const size = getDrivePreviewThumbnailSize()
+
+    setThumbnailState({ status: 'loading' })
+
+    const previewTimeout = window.setTimeout(() => {
+      hasTimedOut = true
+
+      if (!isCancelled) {
+        setThumbnailState({ status: 'missing' })
+      }
+    }, DRIVE_PREVIEW_THUMBNAIL_WAIT_MS)
+
+    void window.oneDriveManager
+      .getDriveThumbnail({
+        accountId: preview.accountId,
+        itemId: item.id,
+        cacheKey: `${getDriveThumbnailCacheKey(item)}:${size}`,
+        priority: 'high',
+        size
+      })
+      .then((thumbnail) => {
+        if (isCancelled) {
+          return
+        }
+
+        window.clearTimeout(previewTimeout)
+
+        if (thumbnail.status === 'ready' && thumbnail.url) {
+          setThumbnailState({
+            status: 'ready',
+            url: thumbnail.url,
+            width: thumbnail.width,
+            height: thumbnail.height
+          })
+          return
+        }
+
+        setThumbnailState({ status: 'missing' })
+      })
+      .catch(() => {
+        window.clearTimeout(previewTimeout)
+
+        if (!isCancelled && !hasTimedOut) {
+          setThumbnailState({ status: 'error' })
+        }
+      })
+
+    return () => {
+      isCancelled = true
+      window.clearTimeout(previewTimeout)
+    }
+  }, [item.id, preview.accountId, thumbnailCacheKey])
+
+  useEffect(() => {
+    previewPanSessionRef.current = null
+    setPreviewTransform({ scale: 1, x: 0, y: 0 })
+  }, [item.id, thumbnailCacheKey])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+        return
+      }
+
+      if (!hasMultipleItems) {
+        return
+      }
+
+      if (event.key === 'ArrowRight' || event.key === 'PageDown') {
+        event.preventDefault()
+        onNext()
+      }
+
+      if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+        event.preventDefault()
+        onPrevious()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [hasMultipleItems, onClose, onNext, onPrevious])
+
+  function setPreviewZoom(nextScale: number): void {
+    setPreviewTransform((currentTransform) => clampPreviewTransform({ ...currentTransform, scale: nextScale }))
+  }
+
+  function resetPreviewTransform(): void {
+    previewPanSessionRef.current = null
+    setPreviewTransform({ scale: 1, x: 0, y: 0 })
+  }
+
+  function handlePreviewWheel(event: ReactWheelEvent<HTMLDivElement>): void {
+    if (!canTransformPreview) {
+      return
+    }
+
+    event.preventDefault()
+    const direction = event.deltaY > 0 ? -1 : 1
+    setPreviewZoom(previewTransform.scale + direction * DRIVE_PREVIEW_ZOOM_STEP)
+  }
+
+  function handlePreviewPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (!canPanPreview || event.button !== 0) {
+      return
+    }
+
+    event.preventDefault()
+    previewPanSessionRef.current = {
+      pointerId: event.pointerId,
+      originX: event.clientX,
+      originY: event.clientY,
+      startX: previewTransform.x,
+      startY: previewTransform.y
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function handlePreviewPointerMove(event: ReactPointerEvent<HTMLDivElement>): void {
+    const panSession = previewPanSessionRef.current
+
+    if (!panSession || panSession.pointerId !== event.pointerId) {
+      return
+    }
+
+    setPreviewTransform((currentTransform) =>
+      clampPreviewTransform({
+        ...currentTransform,
+        x: panSession.startX + event.clientX - panSession.originX,
+        y: panSession.startY + event.clientY - panSession.originY
+      })
+    )
+  }
+
+  function handlePreviewPointerEnd(event: ReactPointerEvent<HTMLDivElement>): void {
+    const panSession = previewPanSessionRef.current
+
+    if (!panSession || panSession.pointerId !== event.pointerId) {
+      return
+    }
+
+    previewPanSessionRef.current = null
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  function clampPreviewTransform(transform: PreviewTransform): PreviewTransform {
+    const scale = clampNumber(transform.scale, DRIVE_PREVIEW_ZOOM_MIN, DRIVE_PREVIEW_ZOOM_MAX)
+
+    if (scale <= DRIVE_PREVIEW_ZOOM_MIN) {
+      return { scale: DRIVE_PREVIEW_ZOOM_MIN, x: 0, y: 0 }
+    }
+
+    const imageWidth = previewImageRef.current?.clientWidth ?? previewStageRef.current?.clientWidth ?? 0
+    const imageHeight = previewImageRef.current?.clientHeight ?? previewStageRef.current?.clientHeight ?? 0
+    const maxX = Math.max(0, (imageWidth * (scale - 1)) / 2)
+    const maxY = Math.max(0, (imageHeight * (scale - 1)) / 2)
+
+    return {
+      scale,
+      x: clampNumber(transform.x, -maxX, maxX),
+      y: clampNumber(transform.y, -maxY, maxY)
+    }
+  }
+
+  return (
+    <div className="preview-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="파일 미리보기"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="preview-dialog-header">
+          <div>
+            <h2 title={item.name}>{item.name}</h2>
+            <span>{`${getTypeLabel(item)} · ${item.type === 'file' ? formatBytes(item.size) : formatDate(item.lastModifiedDateTime)}`}</span>
+          </div>
+          <button className="preview-dialog-close" type="button" aria-label="닫기" onClick={onClose}>
+            x
+          </button>
+        </header>
+
+        <div
+          ref={previewStageRef}
+          className="preview-stage"
+          data-can-pan={canPanPreview ? 'true' : 'false'}
+          data-preview-kind={previewKind}
+          data-thumbnail-state={thumbnailState.status}
+          onPointerDown={handlePreviewPointerDown}
+          onPointerMove={handlePreviewPointerMove}
+          onPointerUp={handlePreviewPointerEnd}
+          onPointerCancel={handlePreviewPointerEnd}
+          onWheel={handlePreviewWheel}
+        >
+          {thumbnailState.status === 'ready' ? (
+            <img
+              ref={previewImageRef}
+              className="preview-image"
+              src={thumbnailState.url}
+              width={thumbnailState.width}
+              height={thumbnailState.height}
+              style={{
+                transform: `translate3d(${previewTransform.x}px, ${previewTransform.y}px, 0) scale(${previewTransform.scale})`
+              }}
+              alt=""
+              aria-hidden="true"
+              decoding="async"
+              draggable={false}
+              referrerPolicy="no-referrer"
+              onError={() => setThumbnailState({ status: 'error' })}
+            />
+          ) : (
+            <div className="preview-placeholder">
+              <DriveItemIcon type={item.type} />
+              <span>{thumbnailState.status === 'loading' ? '미리보기 로딩 중' : '미리보기 없음'}</span>
+            </div>
+          )}
+        </div>
+
+        <footer className="preview-dialog-footer">
+          <button type="button" disabled={!hasMultipleItems} onClick={onPrevious}>
+            이전
+          </button>
+          <div className="preview-zoom-controls" role="group" aria-label="미리보기 확대/축소">
+            <button
+              type="button"
+              aria-label="축소"
+              disabled={!canTransformPreview || previewTransform.scale <= DRIVE_PREVIEW_ZOOM_MIN}
+              onClick={() => setPreviewZoom(previewTransform.scale - DRIVE_PREVIEW_ZOOM_STEP)}
+            >
+              -
+            </button>
+            <span>{`${Math.round(previewTransform.scale * 100)}%`}</span>
+            <button
+              type="button"
+              aria-label="확대"
+              disabled={!canTransformPreview || previewTransform.scale >= DRIVE_PREVIEW_ZOOM_MAX}
+              onClick={() => setPreviewZoom(previewTransform.scale + DRIVE_PREVIEW_ZOOM_STEP)}
+            >
+              +
+            </button>
+            <button type="button" disabled={!canTransformPreview || previewTransform.scale === 1} onClick={resetPreviewTransform}>
+              100%
+            </button>
+          </div>
+          <button type="button" disabled={!hasMultipleItems} onClick={onNext}>
+            다음
+          </button>
+        </footer>
+      </section>
     </div>
   )
 }
@@ -2894,6 +3379,63 @@ function FolderCompareDialog({
   )
 }
 
+function GraphActivityDialog({ events, onClose }: { events: GraphActivityEvent[]; onClose: () => void }): ReactElement {
+  return (
+    <div className="activity-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="activity-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="OneDrive 통신 상태 로그"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="activity-dialog-header">
+          <div>
+            <h2>상태 로그</h2>
+            <span>{events.length.toLocaleString('ko-KR')}개 이벤트</span>
+          </div>
+          <button className="activity-dialog-close" type="button" aria-label="닫기" onClick={onClose}>
+            x
+          </button>
+        </header>
+        <div className="activity-log-list">
+          {events.length > 0 ? (
+            events.map((event) => (
+              <article className="activity-log-item" data-level={event.level} key={event.id}>
+                <div>
+                  <strong>{event.title}</strong>
+                  <time>{formatDateTime(event.at)}</time>
+                </div>
+                <p>{event.message}</p>
+                <small>
+                  {formatGraphActivityScope(event.scope)}
+                  {event.status ? ` · HTTP ${event.status}` : ''}
+                  {event.retryAfterMs ? ` · 재시도 ${formatRetryDelayLabel(event.retryAfterMs)}` : ''}
+                  {event.progress ? ` · ${formatGraphActivityProgressLabel(event)}` : ''}
+                </small>
+                {event.progress ? <GraphActivityProgressBar event={event} /> : null}
+                {event.detail ? <pre>{event.detail}</pre> : null}
+              </article>
+            ))
+          ) : (
+            <div className="activity-log-empty">아직 기록된 OneDrive 통신 이벤트가 없습니다.</div>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function GraphActivityProgressBar({ event }: { event: GraphActivityEvent }): ReactElement {
+  const progressPercent = getGraphActivityProgressPercent(event)
+
+  return (
+    <div className="activity-progress" data-indeterminate={event.progress?.indeterminate ? 'true' : 'false'} aria-hidden="true">
+      <span style={progressPercent === null ? undefined : { width: `${progressPercent}%` }} />
+    </div>
+  )
+}
+
 function AuthSettingsForm({
   clientId,
   tenantId,
@@ -3011,9 +3553,10 @@ function DriveTabPane({
   onBoxSelect,
   onSortOptionsChange,
   onColumnWidthsChange,
+  onViewModeChange,
   onSelectItem,
   onOpenFolder,
-  onDownloadItem,
+  onPreviewItem,
   onRenameItem,
   onDeleteItem,
   onDragOverFolderChange,
@@ -3045,9 +3588,10 @@ function DriveTabPane({
   onBoxSelect: (itemIds: string[]) => void
   onSortOptionsChange: (nextSortOptions: DriveSortOptions) => void
   onColumnWidthsChange: (nextColumnWidths: DriveColumnWidths) => void
+  onViewModeChange: (nextViewMode: DriveViewMode) => void
   onSelectItem: (item: CloudDriveItem, mode: DriveSelectionMode) => void
   onOpenFolder: (item: CloudDriveItem) => void
-  onDownloadItem: (item: CloudDriveItem) => void
+  onPreviewItem: (item: CloudDriveItem) => void
   onRenameItem: (item: CloudDriveItem) => void
   onDeleteItem: (item: CloudDriveItem) => void
   onDragOverFolderChange: (folderId: string | null) => void
@@ -3111,11 +3655,18 @@ function DriveTabPane({
         <Breadcrumb path={tab.folderPath} isDisabled={!canUseDrive || tab.driveState.status === 'loading'} onSelect={onOpenBreadcrumb} />
       </div>
 
-      <DriveSortControls sortOptions={tab.sortOptions} isDisabled={!canUseDrive} onChange={onSortOptionsChange} />
+      <DriveSortControls
+        sortOptions={tab.sortOptions}
+        viewMode={tab.viewMode}
+        isDisabled={!canUseDrive}
+        onChange={onSortOptionsChange}
+        onViewModeChange={onViewModeChange}
+      />
 
       <DriveExplorer
         accountId={tab.accountId}
         state={sortedDriveState}
+        viewMode={tab.viewMode}
         sortOptions={tab.sortOptions}
         columnWidths={tab.columnWidths}
         selectedItemIds={selectedItemIds}
@@ -3132,7 +3683,7 @@ function DriveTabPane({
         onColumnWidthsChange={onColumnWidthsChange}
         onSelectItem={onSelectItem}
         onOpenFolder={onOpenFolder}
-        onDownloadItem={onDownloadItem}
+        onPreviewItem={onPreviewItem}
         onRenameItem={onRenameItem}
         onDeleteItem={onDeleteItem}
         onDragOverFolderChange={onDragOverFolderChange}
@@ -3153,12 +3704,16 @@ function DriveTabPane({
 
 function DriveSortControls({
   sortOptions,
+  viewMode,
   isDisabled,
-  onChange
+  onChange,
+  onViewModeChange
 }: {
   sortOptions: DriveSortOptions
+  viewMode: DriveViewMode
   isDisabled: boolean
   onChange: (nextSortOptions: DriveSortOptions) => void
+  onViewModeChange: (nextViewMode: DriveViewMode) => void
 }): ReactElement {
   return (
     <div className="pane-sort-row" aria-label="정렬 옵션">
@@ -3200,6 +3755,22 @@ function DriveSortControls({
         />
         <span>폴더 먼저</span>
       </label>
+      <div className="view-mode-toggle" aria-label="보기 방식">
+        {(Object.keys(driveViewModeLabels) as DriveViewMode[]).map((mode) => (
+          <button
+            type="button"
+            key={mode}
+            className="view-mode-button"
+            aria-pressed={viewMode === mode}
+            aria-label={`${driveViewModeLabels[mode]} 보기`}
+            title={`${driveViewModeLabels[mode]} 보기`}
+            disabled={isDisabled}
+            onClick={() => onViewModeChange(mode)}
+          >
+            <span className={`view-mode-icon ${mode}`} aria-hidden="true" />
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -3233,6 +3804,7 @@ function Breadcrumb({
 function DriveExplorer({
   accountId,
   state,
+  viewMode,
   sortOptions,
   columnWidths,
   selectedItemIds,
@@ -3249,7 +3821,7 @@ function DriveExplorer({
   onColumnWidthsChange,
   onSelectItem,
   onOpenFolder,
-  onDownloadItem,
+  onPreviewItem,
   onRenameItem,
   onDeleteItem,
   onDragOverFolderChange,
@@ -3261,6 +3833,7 @@ function DriveExplorer({
 }: {
   accountId: string | null
   state: DriveState
+  viewMode: DriveViewMode
   sortOptions: DriveSortOptions
   columnWidths: DriveColumnWidths
   selectedItemIds: string[]
@@ -3277,7 +3850,7 @@ function DriveExplorer({
   onColumnWidthsChange: (nextColumnWidths: DriveColumnWidths) => void
   onSelectItem: (item: CloudDriveItem, mode: DriveSelectionMode) => void
   onOpenFolder: (item: CloudDriveItem) => void
-  onDownloadItem: (item: CloudDriveItem) => void
+  onPreviewItem: (item: CloudDriveItem) => void
   onRenameItem: (item: CloudDriveItem) => void
   onDeleteItem: (item: CloudDriveItem) => void
   onDragOverFolderChange: (folderId: string | null) => void
@@ -3549,6 +4122,12 @@ function DriveExplorer({
       return false
     }
 
+    const largeIconItem = target.closest('.large-icon-item')
+
+    if (largeIconItem) {
+      return false
+    }
+
     const row = target.closest('.details-row')
 
     return !row || !target.closest('.name-cell')
@@ -3582,8 +4161,9 @@ function DriveExplorer({
 
   return (
     <div
-      className="details-view"
-      role="table"
+      className={`drive-explorer ${viewMode === 'details' ? 'details-view' : 'large-icons-view'}`}
+      role={viewMode === 'details' ? 'table' : 'listbox'}
+      aria-multiselectable={viewMode === 'large-icons' ? true : undefined}
       aria-label="OneDrive 파일 목록"
       onContextMenu={(event) => {
         event.preventDefault()
@@ -3597,44 +4177,46 @@ function DriveExplorer({
         }
       }}
     >
-      <div className="details-header" role="row" style={{ gridTemplateColumns: columnGridTemplate, minWidth: columnGridMinWidth }}>
-        {(Object.keys(driveColumnLabels) as DriveColumnKey[]).map((columnKey) => {
-          const sortState = getColumnSortState(sortOptions, columnKey)
+      {viewMode === 'details' ? (
+        <div className="details-header" role="row" style={{ gridTemplateColumns: columnGridTemplate, minWidth: columnGridMinWidth }}>
+          {(Object.keys(driveColumnLabels) as DriveColumnKey[]).map((columnKey) => {
+            const sortState = getColumnSortState(sortOptions, columnKey)
 
-          return (
-          <span className={`details-column-header${sortState !== 'none' ? ' sorted' : ''}`} role="columnheader" aria-sort={sortState} key={columnKey}>
-            <button
-              className="column-sort-button"
-              type="button"
-              title={`${driveColumnLabels[columnKey]} 정렬 전환`}
-              onClick={() => handleColumnHeaderClick(columnKey)}
-              onDoubleClick={() => handleColumnHeaderDoubleClick(columnKey)}
-            >
-              <span className="column-title">{driveColumnLabels[columnKey]}</span>
-              <span className="column-sort-indicator" aria-hidden="true">
-                {sortState === 'ascending' ? '↑' : sortState === 'descending' ? '↓' : ''}
+            return (
+              <span className={`details-column-header${sortState !== 'none' ? ' sorted' : ''}`} role="columnheader" aria-sort={sortState} key={columnKey}>
+                <button
+                  className="column-sort-button"
+                  type="button"
+                  title={`${driveColumnLabels[columnKey]} 정렬 전환`}
+                  onClick={() => handleColumnHeaderClick(columnKey)}
+                  onDoubleClick={() => handleColumnHeaderDoubleClick(columnKey)}
+                >
+                  <span className="column-title">{driveColumnLabels[columnKey]}</span>
+                  <span className="column-sort-indicator" aria-hidden="true">
+                    {sortState === 'ascending' ? '↑' : sortState === 'descending' ? '↓' : ''}
+                  </span>
+                </button>
+                <button
+                  className="column-resize-handle"
+                  type="button"
+                  aria-label={`${driveColumnLabels[columnKey]} 칼럼 폭 조절`}
+                  onMouseDown={(event) => handleColumnResizeMouseDown(event, columnKey)}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  onDoubleClick={(event) => handleColumnResizeDoubleClick(event, columnKey)}
+                />
               </span>
-            </button>
-            <button
-              className="column-resize-handle"
-              type="button"
-              aria-label={`${driveColumnLabels[columnKey]} 칼럼 폭 조절`}
-              onMouseDown={(event) => handleColumnResizeMouseDown(event, columnKey)}
-              onClick={(event) => {
-                event.preventDefault()
-                event.stopPropagation()
-              }}
-              onDoubleClick={(event) => handleColumnResizeDoubleClick(event, columnKey)}
-            />
-          </span>
-          )
-        })}
-      </div>
+            )
+          })}
+        </div>
+      ) : null}
 
       <div
         ref={bodyRef}
-        className="details-body"
-        style={{ minWidth: columnGridMinWidth }}
+        className={viewMode === 'details' ? 'details-body' : 'large-icons-body'}
+        style={viewMode === 'details' ? { minWidth: columnGridMinWidth } : undefined}
         onMouseDown={handleBoxSelectionMouseDown}
         onClickCapture={(event) => {
           suppressClickAfterBoxSelection(event)
@@ -3650,6 +4232,81 @@ function DriveExplorer({
             const isSelected = selectedItemIds.includes(item.id)
             const isCut = cutItemIds.includes(item.id)
             const isDropTarget = item.type === 'folder' && dragOverFolderId === item.id
+
+            if (viewMode === 'large-icons') {
+              const previewKind = getDriveItemPreviewKind(item)
+
+              return (
+                <div
+                  className={`large-icon-item${isSelected ? ' selected' : ''}${isCut ? ' cut' : ''}${isDropTarget ? ' drop-target' : ''}`}
+                  role="option"
+                  tabIndex={0}
+                  aria-selected={isSelected}
+                  key={item.id}
+                  data-drive-item-id={item.id}
+                  draggable={isAuthenticated}
+                  onDragStart={(event) => handleRowDragStart(event, item)}
+                  onDragEnd={() => onDragOverFolderChange(null)}
+                  onDragOver={(event) => handleRowDragOver(event, item)}
+                  onDragLeave={(event) => {
+                    if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
+                      onDragOverFolderChange(null)
+                    }
+                  }}
+                  onDrop={(event) => handleRowDrop(event, item)}
+                  onClick={(event) => {
+                    if (suppressClickAfterBoxSelection(event)) {
+                      return
+                    }
+
+                    const mode = event.shiftKey ? 'range' : event.metaKey || event.ctrlKey ? 'toggle' : 'replace'
+
+                    onSelectItem(item, mode)
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onContextMenuItem(item, { x: event.clientX, y: event.clientY })
+                  }}
+                  onDoubleClick={() => {
+                    if (item.type === 'folder') {
+                      onOpenFolder(item)
+                      return
+                    }
+
+                    onPreviewItem(item)
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+
+                      if (item.type === 'folder') {
+                        onOpenFolder(item)
+                        return
+                      }
+
+                      onPreviewItem(item)
+                    }
+
+                    if (event.key === 'F2') {
+                      event.preventDefault()
+                      onRenameItem(item)
+                    }
+
+                    if (event.key === 'Delete') {
+                      event.preventDefault()
+                      onDeleteItem(item)
+                    }
+                  }}
+                >
+                  <DriveThumbnailPreview accountId={accountId} item={item} previewKind={previewKind} />
+                  <span className="large-icon-name" title={item.name}>
+                    {item.name}
+                  </span>
+                  <span className="large-icon-meta">{getLargeIconMeta(item)}</span>
+                </div>
+              )
+            }
 
             return (
               <div
@@ -3690,9 +4347,7 @@ function DriveExplorer({
                     return
                   }
 
-                  if (item.type === 'file') {
-                    onDownloadItem(item)
-                  }
+                  onPreviewItem(item)
                 }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
@@ -3703,9 +4358,7 @@ function DriveExplorer({
                       return
                     }
 
-                    if (item.type === 'file') {
-                      onDownloadItem(item)
-                    }
+                    onPreviewItem(item)
                   }
 
                   if (event.key === 'F2') {
@@ -3732,7 +4385,11 @@ function DriveExplorer({
             )
           })
         ) : (
-          <div className="explorer-empty" role="row" style={{ minWidth: columnGridMinWidth }}>
+          <div
+            className="explorer-empty"
+            role={viewMode === 'details' ? 'row' : 'presentation'}
+            style={viewMode === 'details' ? { minWidth: columnGridMinWidth } : undefined}
+          >
             {!isAuthenticated ? (
               <div className="login-empty">
                 <strong>OneDrive 파일을 보려면 로그인하세요.</strong>
@@ -3750,7 +4407,7 @@ function DriveExplorer({
       {boxSelection ? <div className="selection-box" style={getBoxSelectionStyle(boxSelection)} /> : null}
 
       {state.nextLink ? (
-        <div className="explorer-footer" style={{ minWidth: columnGridMinWidth }}>
+        <div className="explorer-footer" style={viewMode === 'details' ? { minWidth: columnGridMinWidth } : undefined}>
           <button className="command-button" type="button" disabled={state.status === 'loading'} onClick={onLoadMore}>
             더 불러오기
           </button>
@@ -3762,6 +4419,192 @@ function DriveExplorer({
 
 function DriveItemIcon({ type }: { type: CloudDriveItem['type'] }): ReactElement {
   return <span className={`item-icon ${type}`} aria-hidden="true" />
+}
+
+function DriveThumbnailPreview({
+  accountId,
+  item,
+  previewKind
+}: {
+  accountId: string | null
+  item: CloudDriveItem
+  previewKind: 'image' | 'video' | 'generic'
+}): ReactElement {
+  const previewRef = useRef<HTMLSpanElement | null>(null)
+  const thumbnailCacheKey = getDriveThumbnailCacheKey(item)
+  const canLoadThumbnail = item.type === 'file' && previewKind !== 'generic'
+  const [thumbnailState, setThumbnailState] = useState<ThumbnailPreviewState>({ status: canLoadThumbnail ? 'idle' : 'missing' })
+
+  useEffect(() => {
+    let isCancelled = false
+
+    setThumbnailState({ status: canLoadThumbnail ? 'idle' : 'missing' })
+
+    if (!canLoadThumbnail) {
+      return undefined
+    }
+
+    const loadThumbnail = (): void => {
+      setThumbnailState({ status: 'loading' })
+      void window.oneDriveManager
+        .getDriveThumbnail({
+          accountId,
+          itemId: item.id,
+          cacheKey: thumbnailCacheKey,
+          priority: 'high',
+          size: 'c160x120_crop'
+        })
+        .then((thumbnail) => {
+          if (isCancelled) {
+            return
+          }
+
+          if (thumbnail.status === 'ready' && thumbnail.url) {
+            setThumbnailState({
+              status: 'ready',
+              url: thumbnail.url,
+              width: thumbnail.width,
+              height: thumbnail.height
+            })
+            return
+          }
+
+          setThumbnailState({ status: 'missing' })
+        })
+        .catch(() => {
+          if (!isCancelled) {
+            setThumbnailState({ status: 'error' })
+          }
+        })
+    }
+
+    const element = previewRef.current
+
+    if (!element || !('IntersectionObserver' in window)) {
+      loadThumbnail()
+      return () => {
+        isCancelled = true
+      }
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect()
+          loadThumbnail()
+        }
+      },
+      {
+        root: element.closest('.large-icons-body'),
+        rootMargin: '280px 120px',
+        threshold: 0.01
+      }
+    )
+
+    observer.observe(element)
+
+    return () => {
+      isCancelled = true
+      observer.disconnect()
+    }
+  }, [accountId, canLoadThumbnail, item.id, thumbnailCacheKey])
+
+  return (
+    <span ref={previewRef} className="large-icon-preview" data-preview-kind={previewKind} data-thumbnail-state={thumbnailState.status}>
+      {thumbnailState.status === 'ready' ? (
+        <img
+          className="large-icon-preview-image"
+          src={thumbnailState.url}
+          width={thumbnailState.width}
+          height={thumbnailState.height}
+          alt=""
+          aria-hidden="true"
+          decoding="async"
+          draggable={false}
+          referrerPolicy="no-referrer"
+          onError={() => setThumbnailState({ status: 'error' })}
+        />
+      ) : (
+        <span className="large-icon-preview-symbol" aria-hidden="true">
+          <DriveItemIcon type={item.type} />
+        </span>
+      )}
+    </span>
+  )
+}
+
+function getDriveItemPreviewKind(item: CloudDriveItem): 'image' | 'video' | 'generic' {
+  if (item.type !== 'file') {
+    return 'generic'
+  }
+
+  const mimeType = item.mimeType?.toLocaleLowerCase('en-US') ?? ''
+
+  if (mimeType.startsWith('image/')) {
+    return 'image'
+  }
+
+  if (mimeType.startsWith('video/')) {
+    return 'video'
+  }
+
+  const extension = getFileExtension(item.name)
+
+  if (imageFileExtensions.has(extension)) {
+    return 'image'
+  }
+
+  if (videoFileExtensions.has(extension)) {
+    return 'video'
+  }
+
+  return 'generic'
+}
+
+function getLargeIconMeta(item: CloudDriveItem): string {
+  if (item.type === 'folder') {
+    return item.childCount === undefined ? getTypeLabel(item) : `${item.childCount.toLocaleString('ko-KR')}개 항목`
+  }
+
+  if (item.type === 'package') {
+    return getTypeLabel(item)
+  }
+
+  return formatBytes(item.size)
+}
+
+function getDriveThumbnailCacheKey(item: CloudDriveItem): string {
+  return item.cTag ?? item.eTag ?? `${item.size}:${item.lastModifiedDateTime ?? ''}`
+}
+
+function getDrivePreviewThumbnailSize(): DriveThumbnailSize {
+  const pixelRatio = Math.min(Math.max(window.devicePixelRatio || 1, 1), DRIVE_PREVIEW_THUMBNAIL_MAX_PIXEL_RATIO)
+  const width = Math.round(
+    clampNumber(
+      (window.innerWidth - 64) * pixelRatio,
+      DRIVE_PREVIEW_THUMBNAIL_MIN_WIDTH,
+      DRIVE_PREVIEW_THUMBNAIL_MAX_WIDTH
+    )
+  )
+  const height = Math.round(
+    clampNumber(
+      (window.innerHeight - 148) * pixelRatio,
+      DRIVE_PREVIEW_THUMBNAIL_MIN_HEIGHT,
+      DRIVE_PREVIEW_THUMBNAIL_MAX_HEIGHT
+    )
+  )
+
+  return `c${width}x${height}`
+}
+
+function getFileExtension(name: string): string {
+  const extensionIndex = name.lastIndexOf('.')
+
+  if (extensionIndex < 0 || extensionIndex === name.length - 1) {
+    return ''
+  }
+
+  return name.slice(extensionIndex + 1).toLocaleLowerCase('en-US')
 }
 
 function hasDroppedFiles(event: DragEvent<HTMLElement>): boolean {
@@ -3844,6 +4687,7 @@ function createDriveTab(accountId: string | null): DriveTab {
     driveState: createIdleDriveState(),
     indexState: { status: 'idle' },
     sortOptions: { ...defaultDriveSortOptions },
+    viewMode: 'details',
     columnWidths: { ...defaultDriveColumnWidths },
     paneSize: DEFAULT_DRIVE_PANE_SIZE
   }
@@ -3897,6 +4741,10 @@ function setIndexStateForTab(setTabs: Dispatch<SetStateAction<DriveTab[]>>, tabI
 
 function setSortOptionsForTab(setTabs: Dispatch<SetStateAction<DriveTab[]>>, tabId: string, sortOptions: DriveSortOptions): void {
   setTabs((currentTabs) => currentTabs.map((tab) => (tab.id === tabId ? { ...tab, sortOptions } : tab)))
+}
+
+function setViewModeForTab(setTabs: Dispatch<SetStateAction<DriveTab[]>>, tabId: string, viewMode: DriveViewMode): void {
+  setTabs((currentTabs) => currentTabs.map((tab) => (tab.id === tabId ? { ...tab, viewMode } : tab)))
 }
 
 function setColumnWidthsForTab(setTabs: Dispatch<SetStateAction<DriveTab[]>>, tabId: string, columnWidths: DriveColumnWidths): void {
@@ -4012,6 +4860,10 @@ function getDriveColumnCellText(item: CloudDriveItem, columnKey: DriveColumnKey)
 
 function getSortedDriveTabItems(tab: DriveTab): CloudDriveItem[] {
   return sortDriveItemsForView(tab.driveState.items, tab.sortOptions)
+}
+
+function getDrivePreviewItems(tab: DriveTab | undefined): CloudDriveItem[] {
+  return tab ? getSortedDriveTabItems(tab).filter((item) => item.type !== 'folder') : []
 }
 
 function getSortedDriveState(state: DriveState, sortOptions: DriveSortOptions): DriveState {
@@ -4335,6 +5187,72 @@ function getTransferStatusLabel(task: DriveTransferTask): string {
   }
 
   return task.message ?? '중단됨'
+}
+
+function formatGraphActivityStatus(event: GraphActivityEvent): string {
+  const prefix = event.level === 'error' ? '오류' : event.level === 'warning' ? '주의' : event.level === 'success' ? '완료' : '상태'
+
+  return `${prefix}: ${event.message}`
+}
+
+function formatGraphActivityScope(scope: GraphActivityEvent['scope']): string {
+  if (scope === 'index') {
+    return '인덱스'
+  }
+
+  if (scope === 'thumbnail') {
+    return '썸네일'
+  }
+
+  if (scope === 'transfer') {
+    return '전송'
+  }
+
+  return 'OneDrive'
+}
+
+function getGraphActivityProgressPercent(event: GraphActivityEvent): number | null {
+  const progress = event.progress
+
+  if (!progress || progress.indeterminate || !progress.total || progress.total <= 0 || typeof progress.current !== 'number') {
+    return null
+  }
+
+  return clampNumber(Math.round((progress.current / progress.total) * 100), 0, 100)
+}
+
+function formatGraphActivityProgressLabel(event: GraphActivityEvent): string {
+  const progress = event.progress
+
+  if (!progress) {
+    return ''
+  }
+
+  if (progress.total && progress.total > 0 && typeof progress.current === 'number') {
+    return `${progress.current.toLocaleString('ko-KR')} / ${progress.total.toLocaleString('ko-KR')}`
+  }
+
+  if (typeof progress.current === 'number') {
+    return `${progress.current.toLocaleString('ko-KR')}개 처리`
+  }
+
+  return '진행 중'
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return date.toLocaleString('ko-KR')
+}
+
+function formatRetryDelayLabel(delayMs: number): string {
+  const seconds = Math.max(1, Math.round(delayMs / 1000))
+
+  return seconds < 60 ? `${seconds}초` : `${Math.round(seconds / 60)}분`
 }
 
 function getDriveStatusText(state: DriveState, indexState: IndexState): string {

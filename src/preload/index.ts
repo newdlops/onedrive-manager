@@ -23,6 +23,13 @@ import type {
   DriveFolderReconcileResult,
   DriveIndexStatus,
   DriveIndexWarmRequest,
+  DriveSettings,
+  DriveSettingsInput,
+  DriveSearchRequest,
+  DriveSearchResult,
+  DriveThumbnailRequest,
+  DriveThumbnailResult,
+  GraphActivityEvent,
   MicrosoftAuthSettings,
   MicrosoftAuthSettingsInput,
   MoveDriveItemsRequest,
@@ -44,6 +51,8 @@ const api = {
     ipcRenderer.invoke('settings:updateMicrosoftAuth', input),
   getTransferSettings: (): Promise<TransferSettings> => ipcRenderer.invoke('settings:getTransfer'),
   updateTransferSettings: (input: TransferSettingsInput): Promise<TransferSettings> => ipcRenderer.invoke('settings:updateTransfer', input),
+  getDriveSettings: (): Promise<DriveSettings> => ipcRenderer.invoke('settings:getDrive'),
+  updateDriveSettings: (input: DriveSettingsInput): Promise<DriveSettings> => ipcRenderer.invoke('settings:updateDrive', input),
   getAuthSession: (): Promise<AuthSession> => ipcRenderer.invoke('auth:getSession'),
   listAccountUsage: (): Promise<DriveAccountUsage[]> => ipcRenderer.invoke('auth:listAccountUsage'),
   connectAccount: (): Promise<AuthSession> => ipcRenderer.invoke('auth:connect'),
@@ -53,6 +62,9 @@ const api = {
   listDriveChildren: (request: DriveChildrenRequest): Promise<DriveChildrenResult> =>
     ipcRenderer.invoke('onedrive:listChildren', request),
   warmDriveIndex: (request?: DriveIndexWarmRequest): Promise<DriveIndexStatus> => ipcRenderer.invoke('onedrive:warmIndex', request),
+  searchDriveItems: (request: DriveSearchRequest): Promise<DriveSearchResult> => ipcRenderer.invoke('onedrive:searchItems', request),
+  getDriveThumbnail: (request: DriveThumbnailRequest): Promise<DriveThumbnailResult> =>
+    ipcRenderer.invoke('onedrive:getThumbnail', request),
   compareDriveFolders: (request: DriveFolderCompareRequest): Promise<DriveFolderCompareResult> =>
     ipcRenderer.invoke('onedrive:compareFolders', request),
   reconcileDriveFolders: (request: DriveFolderReconcileRequest): Promise<DriveFolderReconcileResult> =>
@@ -83,6 +95,12 @@ const api = {
 
     ipcRenderer.on('transfers:updated', listener)
     return () => ipcRenderer.removeListener('transfers:updated', listener)
+  },
+  onGraphActivity: (callback: (event: GraphActivityEvent) => void): (() => void) => {
+    const listener = (_event: IpcRendererEvent, graphEvent: GraphActivityEvent): void => callback(graphEvent)
+
+    ipcRenderer.on('graph:activity', listener)
+    return () => ipcRenderer.removeListener('graph:activity', listener)
   }
 }
 
