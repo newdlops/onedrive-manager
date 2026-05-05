@@ -27,6 +27,17 @@ export type DriveDeltaStagePayload = {
   isTombstone?: boolean
 }
 
+export type DriveIndexDeltaChange =
+  | {
+      itemId: string
+      item: CloudDriveItem
+      deleted?: false
+    }
+  | {
+      itemId: string
+      deleted: true
+    }
+
 type DriveIndexDatabaseEntry = {
   db: DatabaseSync
   path: string
@@ -196,6 +207,111 @@ export async function writeDriveIndexToStore(index: DriveIndex, accountId: strin
 
     for (const folderId of Object.keys(index.expandedFolderIds)) {
       insertExpandedFolder.run(folderId)
+    }
+  })
+}
+
+export async function applyDriveIndexDeltaToStore(
+  index: DriveIndex,
+  accountId: string | null,
+  changes: DriveIndexDeltaChange[]
+): Promise<void> {
+  if (!accountId) {
+    throw new Error('Microsoft 계정 로그인이 필요합니다.')
+  }
+
+  const db = await getDriveIndexDatabase(accountId)
+
+  withTransaction(db, () => {
+    writeDriveIndexMetadata(db, index)
+
+    if (changes.length === 0) {
+      return
+    }
+
+    const deleteItemFts = db.prepare(`
+      WITH RECURSIVE descendants(id) AS (
+        SELECT ?
+        UNION ALL
+        SELECT drive_items.id
+        FROM drive_items
+        JOIN descendants ON drive_items.parent_id = descendants.id
+      )
+      DELETE FROM drive_item_fts
+      WHERE item_id IN (SELECT id FROM descendants)
+    `)
+    const deleteItemTrie = db.prepare(`
+      WITH RECURSIVE descendants(id) AS (
+        SELECT ?
+        UNION ALL
+        SELECT drive_items.id
+        FROM drive_items
+        JOIN descendants ON drive_items.parent_id = descendants.id
+      )
+      DELETE FROM drive_path_trie
+      WHERE item_id IN (SELECT id FROM descendants)
+         OR parent_id IN (SELECT id FROM descendants)
+    `)
+    const deleteExpandedFolder = db.prepare(`
+      WITH RECURSIVE descendants(id) AS (
+        SELECT ?
+        UNION ALL
+        SELECT drive_items.id
+        FROM drive_items
+        JOIN descendants ON drive_items.parent_id = descendants.id
+      )
+      DELETE FROM expanded_folders
+      WHERE folder_id IN (SELECT id FROM descendants)
+    `)
+    const deleteItem = db.prepare(`
+      WITH RECURSIVE descendants(id) AS (
+        SELECT ?
+        UNION ALL
+        SELECT drive_items.id
+        FROM drive_items
+        JOIN descendants ON drive_items.parent_id = descendants.id
+      )
+      DELETE FROM drive_items
+      WHERE id IN (SELECT id FROM descendants)
+    `)
+    const deleteSingleItemFts = db.prepare('DELETE FROM drive_item_fts WHERE item_id = ?')
+    const deleteSingleItemTrie = db.prepare('DELETE FROM drive_path_trie WHERE item_id = ?')
+    const insertItem = db.prepare(`
+      INSERT OR REPLACE INTO drive_items (
+        id,
+        name,
+        normalized_name,
+        type,
+        size,
+        last_modified_date_time,
+        web_url,
+        parent_id,
+        child_count,
+        mime_type,
+        quick_xor_hash,
+        c_tag,
+        e_tag,
+        metadata_text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const insertTrieNode = db.prepare(`
+      INSERT OR REPLACE INTO drive_path_trie (parent_id, normalized_name, item_id, item_type)
+      VALUES (?, ?, ?, ?)
+    `)
+    const insertFts = db.prepare('INSERT INTO drive_item_fts (item_id, name, metadata) VALUES (?, ?, ?)')
+
+    for (const change of changes) {
+      if (change.deleted) {
+        deleteItemFts.run(change.itemId)
+        deleteItemTrie.run(change.itemId)
+        deleteExpandedFolder.run(change.itemId)
+        deleteItem.run(change.itemId)
+        continue
+      }
+
+      deleteSingleItemFts.run(change.item.id)
+      deleteSingleItemTrie.run(change.item.id)
+      writeDriveItemRows(index, change.item, insertItem, insertTrieNode, insertFts)
     }
   })
 }
@@ -483,6 +599,60 @@ function rowToDriveItem(row: DriveItemRow): CloudDriveItem {
     quickXorHash: row.quick_xor_hash ?? undefined,
     cTag: row.c_tag ?? undefined,
     eTag: row.e_tag ?? undefined
+  }
+}
+
+function writeDriveIndexMetadata(db: DatabaseSync, index: DriveIndex): void {
+  db.exec('DELETE FROM drive_index_meta')
+  const insertMeta = db.prepare('INSERT INTO drive_index_meta (key, value) VALUES (?, ?)')
+
+  insertMeta.run('schema_version', String(DRIVE_INDEX_SCHEMA_VERSION))
+
+  if (index.rootItemId) {
+    insertMeta.run('root_item_id', index.rootItemId)
+  }
+
+  if (index.deltaLink) {
+    insertMeta.run('delta_link', index.deltaLink)
+  }
+
+  if (index.syncedAt) {
+    insertMeta.run('synced_at', index.syncedAt)
+  }
+}
+
+function writeDriveItemRows(
+  index: DriveIndex,
+  item: CloudDriveItem,
+  insertItem: ReturnType<DatabaseSync['prepare']>,
+  insertTrieNode: ReturnType<DatabaseSync['prepare']>,
+  insertFts: ReturnType<DatabaseSync['prepare']>
+): void {
+  const normalizedName = normalizeDriveItemNameForIndex(item.name)
+  const metadataText = createDriveItemMetadataText(item)
+
+  insertItem.run(
+    item.id,
+    item.name,
+    normalizedName,
+    item.type,
+    Math.max(0, Math.floor(item.size)),
+    item.lastModifiedDateTime ?? null,
+    item.webUrl ?? null,
+    item.parentId ?? null,
+    item.childCount ?? null,
+    item.mimeType ?? null,
+    item.quickXorHash ?? null,
+    item.cTag ?? null,
+    item.eTag ?? null,
+    metadataText
+  )
+  insertFts.run(item.id, item.name, metadataText)
+
+  if (item.parentId) {
+    insertTrieNode.run(item.parentId, normalizedName, item.id, item.type)
+  } else if (index.rootItemId && item.id !== index.rootItemId) {
+    insertTrieNode.run(ROOT_TRIE_PARENT_ID, normalizedName, item.id, item.type)
   }
 }
 

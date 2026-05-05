@@ -10,6 +10,7 @@ import { getActiveAccountId, getGraphAccessToken } from '../auth/microsoftAuth'
 import { getDriveSettings, getTransferSettings } from '../settings'
 import {
   appendDriveDeltaStaging,
+  applyDriveIndexDeltaToStore,
   clearDriveDeltaStaging,
   closeDriveIndexStores,
   createEmptyDriveIndex,
@@ -23,7 +24,8 @@ import {
   searchDriveIndexItems,
   writeDriveIndexToStore,
   type DriveIndex,
-  type DriveDeltaStagePayload
+  type DriveDeltaStagePayload,
+  type DriveIndexDeltaChange
 } from './driveIndexStore'
 import type {
   AuthAccount,
@@ -2140,6 +2142,7 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
           expandedFolderIds: existingIndex.expandedFolderIds ?? {},
           rootItemId
         }
+  let shouldRewriteDriveIndexStore = !parseStoredDriveDeltaUrl(index.deltaLink)
 
   activeDriveIndexSnapshot = index
   activeDriveIndexSnapshotAccountId = accountId
@@ -2150,6 +2153,7 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
     Object.assign(index, createEmptyDriveIndex(rootItemId))
     activeDriveIndexSnapshot = index
     activeDriveIndexSnapshotAccountId = accountId
+    shouldRewriteDriveIndexStore = true
   }
 
   let url = storedDeltaUrl ?? createDeltaUrl()
@@ -2218,11 +2222,19 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
           total: Math.max(deltaSequence, 1)
         }
       })
-      await applyStagedDriveDelta(index, accountId)
-      await clearDriveDeltaStaging(accountId)
+      const indexChanges = await applyStagedDriveDelta(index, accountId)
       index.deltaLink = normalizeDriveDeltaLink(response['@odata.deltaLink'])
       index.syncedAt = new Date().toISOString()
-      await writeDriveIndex(index, accountId)
+
+      if (shouldRewriteDriveIndexStore) {
+        await writeDriveIndex(index, accountId)
+      } else {
+        activeDriveIndexSnapshot = index
+        activeDriveIndexSnapshotAccountId = accountId
+        await applyDriveIndexDeltaToStore(index, accountId, indexChanges)
+      }
+
+      await clearDriveDeltaStaging(accountId)
       emitGraphActivity({
         level: 'success',
         scope: 'index',
@@ -2250,6 +2262,7 @@ async function syncDriveIndex(existingIndex: DriveIndex, generation: number, acc
         activeDriveIndexSnapshot = index
         activeDriveIndexSnapshotAccountId = accountId
         deltaSequence = 0
+        shouldRewriteDriveIndexStore = true
         await resetDriveDeltaStaging(accountId)
         url = parseStoredDriveDeltaUrl(error.location) ?? createDeltaUrl()
         continue
@@ -3266,32 +3279,47 @@ function createDriveDeltaStagePayloads(items: GraphDriveItem[], startSequence: n
   return payloads
 }
 
-async function applyStagedDriveDelta(index: DriveIndex, accountId: string | null): Promise<void> {
+async function applyStagedDriveDelta(index: DriveIndex, accountId: string | null): Promise<DriveIndexDeltaChange[]> {
   const stagePayloads = await readLastOccurrenceDriveDeltaStaging(accountId)
+  const changes: DriveIndexDeltaChange[] = []
 
   for (const stagePayload of stagePayloads) {
-    applyDeltaItem(index, JSON.parse(stagePayload.payload) as GraphDriveItem)
+    const change = applyDeltaItem(index, JSON.parse(stagePayload.payload) as GraphDriveItem)
+
+    if (change) {
+      changes.push(change)
+    }
   }
+
+  return changes
 }
 
-function applyDeltaItem(index: DriveIndex, item: GraphDriveItem): void {
+function applyDeltaItem(index: DriveIndex, item: GraphDriveItem): DriveIndexDeltaChange | null {
   if (!item.id || item.id === index.rootItemId) {
-    return
+    return null
   }
 
   if (item.deleted) {
     removeIndexedItem(index, item.id)
-    return
+    return {
+      itemId: item.id,
+      deleted: true
+    }
   }
 
   const previousItem = index.items[item.id]
   const nextItem = mapDriveItem(item, previousItem)
 
   if (!nextItem.parentId) {
-    return
+    return null
   }
 
   index.items[nextItem.id] = nextItem
+
+  return {
+    itemId: nextItem.id,
+    item: nextItem
+  }
 }
 
 function removeIndexedItem(index: DriveIndex, itemId: string): void {

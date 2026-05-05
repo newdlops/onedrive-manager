@@ -41,9 +41,11 @@ import {
   updateMicrosoftAuthSettings,
   updateTransferSettings
 } from './settings'
+import { getSystemFileIcon } from './systemFileIcons'
 import type {
   CopyDriveItemsRequest,
   DeleteDriveItemRequest,
+  DriveFileIconRequest,
   DownloadDriveItemRequest,
   DownloadDriveItemsRequest,
   DriveChildrenRequest,
@@ -178,6 +180,9 @@ if (!hasSingleInstanceLock) {
   })
   ipcMain.handle('onedrive:getThumbnail', (_event, request: DriveThumbnailRequest) => {
     return getDriveItemThumbnail(request)
+  })
+  ipcMain.handle('onedrive:getFileIcon', (_event, request: DriveFileIconRequest) => {
+    return getSystemFileIcon(request)
   })
   ipcMain.handle('onedrive:compareFolders', (_event, request: DriveFolderCompareRequest) => {
     return compareDriveFolders(request)

@@ -166,6 +166,20 @@ export type DriveThumbnailResult = {
   height?: number
 }
 
+export type DriveFileIconSize = 'small' | 'normal' | 'large'
+
+export type DriveFileIconRequest = {
+  name: string
+  type: CloudDriveItemType
+  mimeType?: string
+  size?: DriveFileIconSize
+}
+
+export type DriveFileIconResult = {
+  cacheKey: string
+  url?: string
+}
+
 export type DriveIndexStatus = {
   isReady: boolean
   isFresh: boolean

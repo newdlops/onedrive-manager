@@ -1,6 +1,6 @@
 {
   "name": "onedrive-manager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Cross-platform Electron desktop app for managing Microsoft OneDrive.",
   "main": "./out/main/index.js",
   "private": true,

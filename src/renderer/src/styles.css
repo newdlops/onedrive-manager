@@ -2084,6 +2084,25 @@ code {
   flex: none;
 }
 
+.item-icon.system {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+}
+
+.item-icon.system::before,
+.item-icon.system::after {
+  content: none;
+}
+
+.item-system-icon {
+  display: block;
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
 .item-icon.folder::before {
   position: absolute;
   top: 5px;
@@ -2145,6 +2164,15 @@ code {
   height: 11px;
   background: #8d6f2a;
   content: "";
+}
+
+.item-icon.system::before,
+.item-icon.system::after,
+.item-icon.file.system::before,
+.item-icon.file.system::after,
+.item-icon.package.system::before,
+.item-icon.package.system::after {
+  content: none;
 }
 
 .explorer-empty {

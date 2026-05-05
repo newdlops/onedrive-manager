@@ -12,6 +12,8 @@ import type {
   DownloadDriveItemsRequest,
   DownloadDriveItemsResult,
   DriveAccountUsage,
+  DriveFileIconRequest,
+  DriveFileIconResult,
   DriveTransferListRequest,
   DriveTransferListResult,
   DriveTransferTask,
@@ -64,6 +66,7 @@ declare global {
       warmDriveIndex: (request?: DriveIndexWarmRequest) => Promise<DriveIndexStatus>
       searchDriveItems: (request: DriveSearchRequest) => Promise<DriveSearchResult>
       getDriveThumbnail: (request: DriveThumbnailRequest) => Promise<DriveThumbnailResult>
+      getDriveFileIcon: (request: DriveFileIconRequest) => Promise<DriveFileIconResult>
       compareDriveFolders: (request: DriveFolderCompareRequest) => Promise<DriveFolderCompareResult>
       reconcileDriveFolders: (request: DriveFolderReconcileRequest) => Promise<DriveFolderReconcileResult>
       renameDriveItem: (request: RenameDriveItemRequest) => Promise<CloudDriveItem>

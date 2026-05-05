@@ -263,6 +263,8 @@ const driveViewModeLabels: Record<DriveViewMode, string> = {
 
 const imageFileExtensions = new Set(['avif', 'bmp', 'gif', 'heic', 'heif', 'jpeg', 'jpg', 'png', 'tif', 'tiff', 'webp'])
 const videoFileExtensions = new Set(['avi', 'm2ts', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'webm', 'wmv'])
+const driveFileIconCache = new Map<string, string | null>()
+const driveFileIconPromises = new Map<string, Promise<string | null>>()
 
 const defaultDriveColumnWidths: DriveColumnWidths = {
   name: 280,
@@ -435,6 +437,8 @@ export function App(): ReactElement {
     const tabId = options.tabId ?? activeTabId
     const accountId = options.accountId ?? getDriveTabAccountId(tabs, tabId) ?? session?.activeAccountId ?? null
     const folder = path.at(-1) ?? rootFolder
+    const currentFolder = tabs.find((tab) => tab.id === tabId)?.folderPath.at(-1) ?? rootFolder
+    const isSameFolderRequest = currentFolder.id === folder.id
     const cacheKey = getFolderCacheKey(accountId, folder)
     const cachedFolder = folderCacheRef.current.get(cacheKey)
 
@@ -459,7 +463,7 @@ export function App(): ReactElement {
 
     setDriveStateForTab(setTabs, tabId, (currentState) => ({
       status: 'loading',
-      items: append ? currentState.items : (forceRefresh ? [] : cachedFolder?.items ?? []),
+      items: append ? currentState.items : (isSameFolderRequest ? currentState.items : cachedFolder?.items ?? []),
       nextLink: append ? currentState.nextLink : cachedFolder?.nextLink
     }))
 
@@ -2904,7 +2908,7 @@ function DrivePreviewDialog({
             />
           ) : (
             <div className="preview-placeholder">
-              <DriveItemIcon type={item.type} />
+              <DriveItemIcon item={item} />
               <span>{thumbnailState.status === 'loading' ? '미리보기 로딩 중' : '미리보기 없음'}</span>
             </div>
           )}
@@ -4373,7 +4377,7 @@ function DriveExplorer({
                 }}
               >
                 <span role="cell" className="name-cell">
-                  <DriveItemIcon type={item.type} />
+                  <DriveItemIcon item={item} />
                   <span className="item-name" title={item.name}>
                     {item.name}
                   </span>
@@ -4417,8 +4421,37 @@ function DriveExplorer({
   )
 }
 
-function DriveItemIcon({ type }: { type: CloudDriveItem['type'] }): ReactElement {
-  return <span className={`item-icon ${type}`} aria-hidden="true" />
+function DriveItemIcon({ item }: { item: CloudDriveItem }): ReactElement {
+  const iconKey = getDriveFileIconCacheKey(item)
+  const [iconUrl, setIconUrl] = useState<string | null>(() => driveFileIconCache.get(iconKey) ?? null)
+
+  useEffect(() => {
+    let isCancelled = false
+
+    setIconUrl(driveFileIconCache.get(iconKey) ?? null)
+
+    if (item.type !== 'file' || driveFileIconCache.has(iconKey)) {
+      return () => {
+        isCancelled = true
+      }
+    }
+
+    void loadDriveFileIcon(item, iconKey).then((url) => {
+      if (!isCancelled) {
+        setIconUrl(url)
+      }
+    })
+
+    return () => {
+      isCancelled = true
+    }
+  }, [iconKey, item.mimeType, item.name, item.type])
+
+  return (
+    <span className={`item-icon ${item.type}${iconUrl ? ' system' : ''}`} aria-hidden="true">
+      {iconUrl ? <img className="item-system-icon" src={iconUrl} alt="" draggable={false} /> : null}
+    </span>
+  )
 }
 
 function DriveThumbnailPreview({
@@ -4526,7 +4559,7 @@ function DriveThumbnailPreview({
         />
       ) : (
         <span className="large-icon-preview-symbol" aria-hidden="true">
-          <DriveItemIcon type={item.type} />
+          <DriveItemIcon item={item} />
         </span>
       )}
     </span>
@@ -4605,6 +4638,44 @@ function getFileExtension(name: string): string {
   }
 
   return name.slice(extensionIndex + 1).toLocaleLowerCase('en-US')
+}
+
+function getDriveFileIconCacheKey(item: CloudDriveItem): string {
+  if (item.type !== 'file') {
+    return item.type
+  }
+
+  return ['file', getFileExtension(item.name) || item.mimeType?.toLocaleLowerCase('en-US') || 'generic', 'normal'].join(':')
+}
+
+function loadDriveFileIcon(item: CloudDriveItem, iconKey: string): Promise<string | null> {
+  if (driveFileIconCache.has(iconKey)) {
+    return Promise.resolve(driveFileIconCache.get(iconKey) ?? null)
+  }
+
+  let promise = driveFileIconPromises.get(iconKey)
+
+  if (!promise) {
+    promise = window.oneDriveManager
+      .getDriveFileIcon({
+        name: item.name,
+        type: item.type,
+        mimeType: item.mimeType,
+        size: 'normal'
+      })
+      .then((result) => result.url ?? null)
+      .catch(() => null)
+      .then((url) => {
+        driveFileIconCache.set(iconKey, url)
+        return url
+      })
+      .finally(() => {
+        driveFileIconPromises.delete(iconKey)
+      })
+    driveFileIconPromises.set(iconKey, promise)
+  }
+
+  return promise
 }
 
 function hasDroppedFiles(event: DragEvent<HTMLElement>): boolean {

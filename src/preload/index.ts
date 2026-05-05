@@ -12,6 +12,8 @@ import type {
   DownloadDriveItemsRequest,
   DownloadDriveItemsResult,
   DriveAccountUsage,
+  DriveFileIconRequest,
+  DriveFileIconResult,
   DriveTransferListRequest,
   DriveTransferListResult,
   DriveTransferTask,
@@ -65,6 +67,8 @@ const api = {
   searchDriveItems: (request: DriveSearchRequest): Promise<DriveSearchResult> => ipcRenderer.invoke('onedrive:searchItems', request),
   getDriveThumbnail: (request: DriveThumbnailRequest): Promise<DriveThumbnailResult> =>
     ipcRenderer.invoke('onedrive:getThumbnail', request),
+  getDriveFileIcon: (request: DriveFileIconRequest): Promise<DriveFileIconResult> =>
+    ipcRenderer.invoke('onedrive:getFileIcon', request),
   compareDriveFolders: (request: DriveFolderCompareRequest): Promise<DriveFolderCompareResult> =>
     ipcRenderer.invoke('onedrive:compareFolders', request),
   reconcileDriveFolders: (request: DriveFolderReconcileRequest): Promise<DriveFolderReconcileResult> =>
