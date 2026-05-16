@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   Dispatch,
   DragEvent,
+  FormEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   ReactElement,
@@ -208,6 +209,13 @@ type FolderCompareState =
   | { status: 'loading'; source: FolderCompareEndpointView; target: FolderCompareEndpointView; result: DriveFolderCompareResult | null }
   | { status: 'ready'; source: FolderCompareEndpointView; target: FolderCompareEndpointView; result: DriveFolderCompareResult }
   | { status: 'error'; source: FolderCompareEndpointView; target: FolderCompareEndpointView; result: DriveFolderCompareResult | null; message: string }
+
+type DriveNameDialogState = {
+  title: string
+  label: string
+  initialValue: string
+  confirmLabel: string
+}
 
 const DRIVE_ITEM_DRAG_TYPE = 'application/x-onedrive-manager-items'
 
@@ -419,11 +427,13 @@ export function App(): ReactElement {
   })
   const [drivePreview, setDrivePreview] = useState<DrivePreviewState | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  const [driveNameDialog, setDriveNameDialog] = useState<DriveNameDialogState | null>(null)
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
   const [isSavingSettings, setIsSavingSettings] = useState(false)
   const [isResettingSettings, setIsResettingSettings] = useState(false)
   const folderCacheRef = useRef(new Map<string, CachedDriveFolder>())
+  const driveNameDialogResolveRef = useRef<((value: string | null) => void) | null>(null)
   const paneResizeSessionRef = useRef<PaneResizeSession | null>(null)
   const session = sessionState.status === 'ready' ? sessionState.session : null
   const accountUsageKey = session?.accounts.map((account) => account.homeAccountId).join('|') ?? ''
@@ -1375,6 +1385,23 @@ export function App(): ReactElement {
     }))
   }
 
+  function requestDriveName(dialog: DriveNameDialogState): Promise<string | null> {
+    driveNameDialogResolveRef.current?.(null)
+
+    return new Promise((resolve) => {
+      driveNameDialogResolveRef.current = resolve
+      setDriveNameDialog(dialog)
+    })
+  }
+
+  function resolveDriveNameDialog(value: string | null): void {
+    const resolve = driveNameDialogResolveRef.current
+
+    driveNameDialogResolveRef.current = null
+    setDriveNameDialog(null)
+    resolve?.(value)
+  }
+
   async function loadTransferViewerPage(offset: number): Promise<void> {
     const normalizedOffset = Math.max(0, offset)
 
@@ -1435,6 +1462,57 @@ export function App(): ReactElement {
       setFileOperationState({
         status: 'error',
         message: error instanceof Error ? error.message : '파일을 업로드하지 못했습니다.'
+      })
+    }
+  }
+
+  async function createFolder(): Promise<void> {
+    if (!canUseDrive || fileOperationState.status === 'working') {
+      return
+    }
+
+    if (typeof window.oneDriveManager.createDriveFolder !== 'function') {
+      setFileOperationState({ status: 'error', message: '앱을 다시 실행한 뒤 폴더 생성을 사용할 수 있습니다.' })
+      return
+    }
+
+    setContextMenu(null)
+    const currentFolder = folderPath.at(-1) ?? rootFolder
+    const nextName = await requestDriveName({
+      title: '새 폴더',
+      label: '폴더 이름',
+      initialValue: getAvailableNewFolderName(driveState.items),
+      confirmLabel: '만들기'
+    })
+
+    if (!nextName) {
+      return
+    }
+
+    const validationError = validateDriveItemName(nextName)
+
+    if (validationError) {
+      setContextMenu(null)
+      setFileOperationState({ status: 'error', message: validationError })
+      return
+    }
+
+    setFileOperationState({ status: 'working', message: '폴더 생성 중' })
+
+    try {
+      const createdFolder = await window.oneDriveManager.createDriveFolder({
+        parentId: currentFolder.id,
+        name: nextName
+      })
+
+      folderCacheRef.current.clear()
+      await loadDriveFolder(folderPath, { forceRefresh: true })
+      void warmNavigationIndex(true)
+      setFileOperationState({ status: 'success', message: `폴더 생성 완료: ${createdFolder.name}` })
+    } catch (error) {
+      setFileOperationState({
+        status: 'error',
+        message: error instanceof Error ? error.message : '폴더를 만들지 못했습니다.'
       })
     }
   }
@@ -1840,7 +1918,12 @@ export function App(): ReactElement {
     }
 
     setContextMenu(null)
-    const nextName = window.prompt('새 이름을 입력하세요.', item.name)?.trim()
+    const nextName = await requestDriveName({
+      title: '이름 변경',
+      label: '새 이름',
+      initialValue: item.name,
+      confirmLabel: '변경'
+    })
 
     if (!nextName || nextName === item.name) {
       return
@@ -2419,8 +2502,17 @@ export function App(): ReactElement {
           onCompareFolder={() => void compareFolderWithSource()}
           onRename={() => void renameSelectedItem()}
           onDelete={() => void deleteSelectedItems()}
+          onCreateFolder={() => void createFolder()}
           onUpload={() => void uploadFiles()}
           onRefresh={() => void refreshCurrentFolder()}
+        />
+      ) : null}
+
+      {driveNameDialog ? (
+        <DriveNameDialog
+          dialog={driveNameDialog}
+          onCancel={() => resolveDriveNameDialog(null)}
+          onSubmit={(value) => resolveDriveNameDialog(value)}
         />
       ) : null}
 
@@ -2468,6 +2560,92 @@ export function App(): ReactElement {
         <span>{environment ? platformLabels[environment.platform.name] ?? environment.platform.name : getEnvironmentStatus(environmentState)}</span>
       </footer>
     </main>
+  )
+}
+
+function DriveNameDialog({
+  dialog,
+  onCancel,
+  onSubmit
+}: {
+  dialog: DriveNameDialogState
+  onCancel: () => void
+  onSubmit: (value: string) => void
+}): ReactElement {
+  const [value, setValue] = useState(dialog.initialValue)
+  const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    setValue(dialog.initialValue)
+    setError(null)
+  }, [dialog])
+
+  useEffect(() => {
+    inputRef.current?.focus()
+    inputRef.current?.select()
+  }, [dialog])
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        onCancel()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onCancel])
+
+  function handleSubmit(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault()
+    const normalizedValue = value.trim()
+    const validationError = validateDriveItemName(normalizedValue)
+
+    if (validationError) {
+      setError(validationError)
+      return
+    }
+
+    onSubmit(normalizedValue)
+  }
+
+  return (
+    <div className="name-dialog-backdrop" role="presentation" onMouseDown={onCancel}>
+      <form
+        className="name-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drive-name-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={handleSubmit}
+      >
+        <header>
+          <h2 id="drive-name-dialog-title">{dialog.title}</h2>
+        </header>
+        <label>
+          <span>{dialog.label}</span>
+          <input
+            ref={inputRef}
+            type="text"
+            value={value}
+            onChange={(event) => {
+              setValue(event.target.value)
+              if (error) {
+                setError(null)
+              }
+            }}
+          />
+        </label>
+        {error ? <p>{error}</p> : null}
+        <footer>
+          <button type="button" onClick={onCancel}>
+            취소
+          </button>
+          <button type="submit">{dialog.confirmLabel}</button>
+        </footer>
+      </form>
+    </div>
   )
 }
 
@@ -2574,6 +2752,7 @@ function ExplorerContextMenu({
   onCompareFolder,
   onRename,
   onDelete,
+  onCreateFolder,
   onUpload,
   onRefresh
 }: {
@@ -2597,6 +2776,7 @@ function ExplorerContextMenu({
   onCompareFolder: () => void
   onRename: () => void
   onDelete: () => void
+  onCreateFolder: () => void
   onUpload: () => void
   onRefresh: () => void
 }): ReactElement {
@@ -2652,6 +2832,9 @@ function ExplorerContextMenu({
         삭제
       </button>
       <span className="context-menu-separator" role="separator" />
+      <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onCreateFolder}>
+        새 폴더
+      </button>
       <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onUpload}>
         업로드
       </button>
@@ -5388,6 +5571,29 @@ function validateDriveItemName(name: string): string | null {
   }
 
   return null
+}
+
+function getAvailableNewFolderName(items: CloudDriveItem[]): string {
+  const baseName = '새 폴더'
+  const occupiedNames = new Set(items.map((item) => normalizeDriveItemNameForConflict(item.name)))
+
+  if (!occupiedNames.has(normalizeDriveItemNameForConflict(baseName))) {
+    return baseName
+  }
+
+  let index = 2
+  let candidate = `${baseName} (${index})`
+
+  while (occupiedNames.has(normalizeDriveItemNameForConflict(candidate))) {
+    index += 1
+    candidate = `${baseName} (${index})`
+  }
+
+  return candidate
+}
+
+function normalizeDriveItemNameForConflict(name: string): string {
+  return name.trim().toLocaleLowerCase('ko-KR')
 }
 
 function getTypeLabel(item: CloudDriveItem): string {

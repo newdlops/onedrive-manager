@@ -6,6 +6,7 @@ import type {
   CloudDriveItem,
   CopyDriveItemsRequest,
   CopyDriveItemsResult,
+  CreateDriveFolderRequest,
   DeleteDriveItemRequest,
   DownloadDriveItemRequest,
   DownloadDriveItemResult,
@@ -73,6 +74,8 @@ const api = {
     ipcRenderer.invoke('onedrive:compareFolders', request),
   reconcileDriveFolders: (request: DriveFolderReconcileRequest): Promise<DriveFolderReconcileResult> =>
     ipcRenderer.invoke('onedrive:reconcileFolders', request),
+  createDriveFolder: (request: CreateDriveFolderRequest): Promise<CloudDriveItem> =>
+    ipcRenderer.invoke('onedrive:createFolder', request),
   renameDriveItem: (request: RenameDriveItemRequest): Promise<CloudDriveItem> => ipcRenderer.invoke('onedrive:renameItem', request),
   deleteDriveItem: (request: DeleteDriveItemRequest): Promise<void> => ipcRenderer.invoke('onedrive:deleteItem', request),
   copyDriveItems: (request: CopyDriveItemsRequest): Promise<CopyDriveItemsResult> => ipcRenderer.invoke('onedrive:copyItems', request),

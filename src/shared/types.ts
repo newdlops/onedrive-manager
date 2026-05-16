@@ -256,6 +256,11 @@ export type RenameDriveItemRequest = {
   name: string
 }
 
+export type CreateDriveFolderRequest = {
+  parentId?: string | null
+  name: string
+}
+
 export type DeleteDriveItemRequest = {
   itemId: string
 }

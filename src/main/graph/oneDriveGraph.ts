@@ -33,6 +33,7 @@ import type {
   CloudDriveItemType,
   CopyDriveItemsRequest,
   CopyDriveItemsResult,
+  CreateDriveFolderRequest,
   DeleteDriveItemRequest,
   DriveAccountUsage,
   DriveFolderCompareDifference,
@@ -1192,6 +1193,31 @@ export async function renameDriveItem(request: RenameDriveItemRequest): Promise<
   })
 
   return mergeRemoteDriveItem(updatedItem)
+}
+
+export async function createDriveFolder(request: CreateDriveFolderRequest): Promise<CloudDriveItem> {
+  const name = validateDriveItemName(request.name)
+  const index = await ensureDriveIndexForListing(false)
+  const parentId = request.parentId ?? index.rootItemId
+
+  if (!parentId) {
+    throw new Error('폴더를 만들 OneDrive 위치를 확인하지 못했습니다.')
+  }
+
+  const accessToken = await getGraphAccessToken()
+  const graphItem = await graphSend<GraphDriveItem>(createChildrenCollectionUrl(index, parentId), accessToken, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name,
+      folder: {},
+      '@microsoft.graph.conflictBehavior': 'rename'
+    })
+  })
+
+  return mergeRemoteDriveItem(graphItem, parentId)
 }
 
 export async function deleteDriveItem(request: DeleteDriveItemRequest): Promise<void> {
@@ -2447,7 +2473,19 @@ async function copyDriveItemToFolder(
     return false
   }
 
-  return waitForGraphCopyOperation(parseTrustedCopyMonitorUrl(monitorUrl), accessToken)
+  const trustedMonitorUrl = parseTrustedCopyMonitorUrl(monitorUrl)
+
+  if (!trustedMonitorUrl) {
+    emitGraphActivity({
+      level: 'warning',
+      scope: 'graph',
+      title: 'OneDrive 복사 상태 확인 건너뜀',
+      message: '복사 요청은 접수됐지만 진행 상태 주소를 앱에서 확인하지 못했습니다.'
+    })
+    return false
+  }
+
+  return waitForGraphCopyOperation(trustedMonitorUrl, accessToken)
 }
 
 async function waitForGraphCopyOperation(monitorUrl: URL, accessToken: string): Promise<boolean> {
@@ -5349,15 +5387,27 @@ function isDriveDeltaUrl(url: URL): boolean {
   return /\/drive\/root\/delta(?:$|\()/.test(pathname) || /\/drives\/[^/]+\/root\/delta(?:$|\()/.test(pathname)
 }
 
-function parseTrustedCopyMonitorUrl(value: string): URL {
-  const url = new URL(value)
+function parseTrustedCopyMonitorUrl(value: string): URL | null {
+  let url: URL
+
+  try {
+    url = new URL(value, GRAPH_BASE_URL)
+  } catch {
+    return null
+  }
+
   const hostname = url.hostname.toLowerCase()
 
   if (
     url.protocol !== 'https:' ||
-    (hostname !== 'graph.microsoft.com' && !hostname.endsWith('.sharepoint.com') && hostname !== 'api.onedrive.com')
+    (hostname !== 'graph.microsoft.com' &&
+      hostname !== 'api.onedrive.com' &&
+      !hostname.endsWith('.sharepoint.com') &&
+      !hostname.endsWith('.sharepoint-df.com') &&
+      !hostname.endsWith('.1drv.com') &&
+      !hostname.endsWith('.onedrive.com'))
   ) {
-    throw new Error('OneDrive 복사 진행 상태 주소가 올바르지 않습니다.')
+    return null
   }
 
   return url

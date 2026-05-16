@@ -6,6 +6,7 @@ import type {
   CloudDriveItem,
   CopyDriveItemsRequest,
   CopyDriveItemsResult,
+  CreateDriveFolderRequest,
   DeleteDriveItemRequest,
   DownloadDriveItemRequest,
   DownloadDriveItemResult,
@@ -69,6 +70,7 @@ declare global {
       getDriveFileIcon: (request: DriveFileIconRequest) => Promise<DriveFileIconResult>
       compareDriveFolders: (request: DriveFolderCompareRequest) => Promise<DriveFolderCompareResult>
       reconcileDriveFolders: (request: DriveFolderReconcileRequest) => Promise<DriveFolderReconcileResult>
+      createDriveFolder: (request: CreateDriveFolderRequest) => Promise<CloudDriveItem>
       renameDriveItem: (request: RenameDriveItemRequest) => Promise<CloudDriveItem>
       deleteDriveItem: (request: DeleteDriveItemRequest) => Promise<void>
       copyDriveItems: (request: CopyDriveItemsRequest) => Promise<CopyDriveItemsResult>

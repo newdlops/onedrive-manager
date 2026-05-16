@@ -6,6 +6,7 @@ import {
   clearDriveIndexMemory,
   compareDriveFolders,
   copyDriveItems,
+  createDriveFolder,
   deleteDriveItem,
   deleteDriveTransfer,
   downloadDriveItemsToDirectory,
@@ -44,6 +45,7 @@ import {
 import { getSystemFileIcon } from './systemFileIcons'
 import type {
   CopyDriveItemsRequest,
+  CreateDriveFolderRequest,
   DeleteDriveItemRequest,
   DriveFileIconRequest,
   DownloadDriveItemRequest,
@@ -189,6 +191,9 @@ if (!hasSingleInstanceLock) {
   })
   ipcMain.handle('onedrive:reconcileFolders', (event, request: DriveFolderReconcileRequest) => {
     return reconcileComparedDriveFolders(request, createTransferNotifier(event.sender))
+  })
+  ipcMain.handle('onedrive:createFolder', (_event, request: CreateDriveFolderRequest) => {
+    return createDriveFolder(request)
   })
   ipcMain.handle('onedrive:renameItem', (_event, request: RenameDriveItemRequest) => {
     return renameDriveItem(request)
