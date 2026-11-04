@@ -811,6 +811,10 @@ export function App(): ReactElement {
 
   async function ensureAuthSettingsBeforeLogin(): Promise<boolean> {
     const activeSettings = sessionState.status === 'ready' ? sessionState.session.settings : null
+    if (activeSettings?.isConfigured && activeSettings.source === 'environment') {
+      return true
+    }
+
     const nextSettings = {
       clientId: settingsForm.clientId.trim(),
       tenantId: settingsForm.tenantId.trim() || DEFAULT_TENANT_ID
