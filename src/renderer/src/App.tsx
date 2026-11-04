@@ -1433,7 +1433,7 @@ export function App(): ReactElement {
     }
   }
 
-  async function uploadFiles(): Promise<void> {
+  async function uploadFiles(kind: 'file' | 'folder' = 'file'): Promise<void> {
     if (!canUseDrive || fileOperationState.status === 'working') {
       return
     }
@@ -1444,7 +1444,7 @@ export function App(): ReactElement {
     setFileOperationState({ status: 'working', message: '업로드 중' })
 
     try {
-      const result = await window.oneDriveManager.uploadDriveItems({ parentId: currentFolder.id })
+      const result = await window.oneDriveManager.uploadDriveItems({ parentId: currentFolder.id, kind })
 
       if (result.cancelled) {
         setFileOperationState({ status: 'idle' })
@@ -1461,7 +1461,7 @@ export function App(): ReactElement {
     } catch (error) {
       setFileOperationState({
         status: 'error',
-        message: error instanceof Error ? error.message : '파일을 업로드하지 못했습니다.'
+        message: error instanceof Error ? error.message : '파일/폴더를 업로드하지 못했습니다.'
       })
     }
   }
@@ -2218,7 +2218,10 @@ export function App(): ReactElement {
 
       <section className="command-bar" aria-label="파일 관리자 명령">
         <button className="command-button" type="button" disabled={!canUseDrive || isFileOperationBusy} onClick={() => void uploadFiles()}>
-          업로드
+          파일 업로드
+        </button>
+        <button className="command-button" type="button" disabled={!canUseDrive || isFileOperationBusy} onClick={() => void uploadFiles('folder')}>
+          폴더 업로드
         </button>
         <button
           className="command-button"
@@ -2504,6 +2507,7 @@ export function App(): ReactElement {
           onDelete={() => void deleteSelectedItems()}
           onCreateFolder={() => void createFolder()}
           onUpload={() => void uploadFiles()}
+          onUploadFolder={() => void uploadFiles('folder')}
           onRefresh={() => void refreshCurrentFolder()}
         />
       ) : null}
@@ -2754,6 +2758,7 @@ function ExplorerContextMenu({
   onDelete,
   onCreateFolder,
   onUpload,
+  onUploadFolder,
   onRefresh
 }: {
   x: number
@@ -2778,6 +2783,7 @@ function ExplorerContextMenu({
   onDelete: () => void
   onCreateFolder: () => void
   onUpload: () => void
+  onUploadFolder: () => void
   onRefresh: () => void
 }): ReactElement {
   const selectedFolder = singleSelectedItem?.type === 'folder' ? singleSelectedItem : null
@@ -2836,7 +2842,10 @@ function ExplorerContextMenu({
         새 폴더
       </button>
       <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onUpload}>
-        업로드
+        파일 업로드
+      </button>
+      <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onUploadFolder}>
+        폴더 업로드
       </button>
       <button type="button" role="menuitem" disabled={!canUseDrive || isBusy} onClick={onRefresh}>
         새로고침

@@ -214,8 +214,8 @@ if (!hasSingleInstanceLock) {
     const browserWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined
     const notifyTransfers = createTransferNotifier(event.sender)
     const dialogOptions: OpenDialogOptions = {
-      title: '업로드할 파일 선택',
-      properties: ['openFile', 'multiSelections']
+      title: request?.kind === 'folder' ? '업로드할 폴더 선택' : '업로드할 파일 선택',
+      properties: [request?.kind === 'folder' ? 'openDirectory' : 'openFile', 'multiSelections']
     }
     const selection = browserWindow ? await dialog.showOpenDialog(browserWindow, dialogOptions) : await dialog.showOpenDialog(dialogOptions)
 

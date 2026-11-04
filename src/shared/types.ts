@@ -305,6 +305,7 @@ export type DownloadDriveItemsResult = {
 }
 
 export type UploadDriveItemsRequest = {
+  kind?: 'file' | 'folder'
   parentId?: string | null
 }
 
